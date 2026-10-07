@@ -1,0 +1,7 @@
+.cache/
+__pycache__/
+*.pyc
+settings.json
+dictation_app.log*
+.venv/
+python/

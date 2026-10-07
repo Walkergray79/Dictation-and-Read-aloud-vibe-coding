@@ -1,0 +1,11 @@
+# Installed automatically by dictation_app.py on first run.
+# Listed here for reference / manual installs:  python -m pip install -r requirements.txt
+faster-whisper>=1.0.0
+kokoro-onnx>=0.4.0
+sounddevice>=0.4.6
+numpy
+pynput>=1.7.6
+pyperclip>=1.8.2
+pystray>=0.19.4
+pillow
+truststore
