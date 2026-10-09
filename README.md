@@ -47,6 +47,17 @@ uv venv --python 3.12 .venv
 
 > The python.org *embeddable* zip also works, but it needs extra setup. Uncomment `import site` in `python312._pth`, then run `get-pip.py`. Options A and B are easier.
 
+## Where to put the files
+
+Put the files in a **short** folder path, so that `dictation_app.py` sits directly inside it:
+
+```
+C:\Users\<you>\DictationHelper\dictation_app.py     <- good
+C:\Users\<you>\DictationHelper\Dictation-and-Read-aloud-vibe-coding-claude-...\Dictation-and-...\dictation_app.py   <- too long
+```
+
+When you use "Extract All" on a GitHub ZIP, Windows nests the long-named folder twice. Move the files up so they sit directly in `DictationHelper`. Windows limits file paths to 260 characters, and the model files need room inside `.cache`.
+
 ## First run (online, once)
 
 ```bat

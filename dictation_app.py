@@ -154,6 +154,7 @@ MAX_READ_CHARS = 20000
 READ_CLIPBOARD_IF_NO_SELECTION = True  # F10 with nothing highlighted reads the clipboard
 
 IS_WINDOWS = sys.platform == "win32"
+LONG_PATH_WARNING = 150  # chars; model files add ~60 more and Windows caps paths at 260
 
 # ---- Logging -------------------------------------------------------------------
 log = logging.getLogger("dictation")
@@ -369,15 +370,18 @@ def download_file(url: str, dest: Path) -> None:
 
 def load_whisper(model_name: str):
     from faster_whisper import WhisperModel
+    from faster_whisper.utils import download_model
 
-    root = str(CACHE_DIR / "whisper")
-    kwargs = dict(device="cpu", compute_type="int8", download_root=root,
-                  cpu_threads=max(1, min(8, (os.cpu_count() or 4))))
-    try:  # offline first
-        return WhisperModel(model_name, local_files_only=True, **kwargs)
-    except Exception:
+    # Download into a plain folder (.cache\whisper\base.en\model.bin) rather than the
+    # Hugging Face cache layout, whose deep "models--.../snapshots/<hash>" paths can
+    # exceed Windows' 260-character path limit. Once present, no network is touched.
+    model_dir = CACHE_DIR / "whisper" / model_name
+    needed = ("config.json", "model.bin", "tokenizer.json")
+    if not all((model_dir / f).exists() for f in needed):
         log.info("Whisper model '%s' not cached yet - downloading (one time)...", model_name)
-        return WhisperModel(model_name, local_files_only=False, **kwargs)
+        download_model(model_name, output_dir=str(model_dir))
+    return WhisperModel(str(model_dir), device="cpu", compute_type="int8",
+                        cpu_threads=max(1, min(8, (os.cpu_count() or 4))))
 
 
 def load_kokoro():
@@ -891,8 +895,13 @@ class App:
         except Exception as exc:
             log.exception("Model loading failed")
             self.set_state("error")
-            self.notify(f"Could not load speech models: {exc}\n"
-                        "Connect to the internet for the first run, then restart.")
+            if isinstance(exc, (FileNotFoundError, OSError)) and getattr(exc, "winerror", None) in (3, 206):
+                hint = ("The folder path is too long for Windows. Move the app to a short folder "
+                        "such as C:\\Users\\<you>\\DictationHelper, delete .cache, and run it again.")
+            else:
+                hint = "Connect to the internet for the first run, then restart the app."
+            log.error("STARTUP FAILED: %s", hint)
+            self.notify(f"Could not load speech models. {hint}")
 
     def _reload_whisper(self):
         try:
@@ -908,6 +917,12 @@ class App:
 
     def _setup(self, icon):
         icon.visible = True
+        if IS_WINDOWS and len(str(APP_DIR)) > LONG_PATH_WARNING:
+            log.warning("App folder path is %d characters long: %s", len(str(APP_DIR)), APP_DIR)
+            log.warning("Windows limits paths to 260 characters. If model loading fails, move "
+                        "this folder somewhere shorter, e.g. C:\\Users\\<you>\\DictationHelper")
+            self.notify("This folder's path is very long, which can break model downloads. "
+                        "If loading fails, move it to e.g. C:\\Users\\<you>\\DictationHelper.")
         for target, name in ((self._controller_loop, "controller"),
                              (self._transcribe_loop, "transcriber"),
                              (self._load_models, "model-loader"),
