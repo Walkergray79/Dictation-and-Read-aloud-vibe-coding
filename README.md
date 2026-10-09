@@ -108,7 +108,7 @@ Double-click **`run_silent.bat`**, which runs `pythonw`, so no console window ap
 Quit the helper from the tray first, then double-click **`uninstall.bat`**. It asks you to confirm, then:
 
 1. stops the helper if it's still running;
-2. deletes the downloaded models (`.cache`), `settings.json`, `custom_words.txt` and the log files;
+2. deletes the downloaded models (`.cache`), `settings.json` and the log files. It **asks** whether to keep `custom_words.txt`; a kept file stays in the folder, and a reinstall into the same folder picks it up again;
 3. removes the start-at-login shortcut, if it points to this folder;
 4. **asks** whether to remove the Python packages the helper installed (about 600 MB).
    - Answer **N** if you'll reinstall soon; the next first run is then much quicker.

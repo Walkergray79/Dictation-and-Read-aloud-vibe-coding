@@ -12,7 +12,8 @@ echo.
 echo This will:
 echo   - stop the helper if it is running
 echo   - delete the downloaded speech models (the .cache folder)
-echo   - delete your settings, custom words and log files
+echo   - delete your settings and log files
+echo   - delete your custom words, unless you choose to keep them
 echo   - remove the "start at login" shortcut, if you made one
 echo   - delete the app files in this folder:
 echo       %APPDIR%
@@ -22,6 +23,15 @@ echo.
 choice /c YN /m "Continue with the uninstall"
 if errorlevel 2 goto :cancel
 
+set "KEEPWORDS=N"
+if not exist "custom_words.txt" goto :words_asked
+echo.
+echo Your custom words file holds acronyms and pronunciations you have added.
+echo If you keep it, it stays in this folder and a reinstall here will use it again.
+choice /c YN /m "Keep your custom words file - custom_words.txt"
+if not errorlevel 2 set "KEEPWORDS=Y"
+:words_asked
+
 echo.
 echo [1/5] Stopping the helper...
 powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.Name -notmatch 'powershell' -and $_.CommandLine -like '*dictation_app.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
@@ -30,7 +40,9 @@ timeout /t 2 /nobreak >nul
 echo [2/5] Deleting speech models, settings and logs...
 if exist ".cache" rd /s /q ".cache"
 if exist "__pycache__" rd /s /q "__pycache__"
-del /q "settings.json" "custom_words.txt" "dictation_app.log*" 2>nul
+del /q "settings.json" "dictation_app.log*" 2>nul
+if /i "%KEEPWORDS%"=="Y" echo       Keeping custom_words.txt
+if /i not "%KEEPWORDS%"=="Y" del /q "custom_words.txt" 2>nul
 if exist ".cache" echo       WARNING: could not delete .cache - quit the helper from the tray and run this again.
 
 echo [3/5] Removing the start-at-login shortcut...
@@ -52,10 +64,12 @@ del /q "dictation_app.py" "README.md" "requirements.txt" ".gitignore" "run_first
 echo.
 echo Uninstall complete. If a helper icon is still in the system tray,
 echo it will disappear when you move the mouse over it.
+if /i "%KEEPWORDS%"=="Y" echo Your custom words were kept in: %APPDIR%\custom_words.txt
 echo.
 echo Press any key to close - this uninstaller then deletes itself.
 pause >nul
-REM Deletes this file, then the folder if it is now empty (never anything else).
+REM Deletes this file, then the folder if it is now empty (never anything else,
+REM so a kept custom_words.txt - and the folder holding it - survive).
 cd /d "%TEMP%" & (goto) 2>nul & del "%~f0" & rd "%APPDIR%" 2>nul
 
 :cancel
