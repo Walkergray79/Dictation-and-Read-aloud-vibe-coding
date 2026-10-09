@@ -97,6 +97,20 @@ On the first run, the script:
 
 Double-click **`run_silent.bat`**, which runs `pythonw`, so no console window appears. To start the helper automatically at login, press **Win + R**, type `shell:startup`, and put a shortcut to `run_silent.bat` in that folder.
 
+## Uninstalling
+
+Quit the helper from the tray first, then double-click **`uninstall.bat`**. It asks you to confirm, then:
+
+1. stops the helper if it's still running;
+2. deletes the downloaded models (`.cache`), `settings.json`, `custom_words.txt` and the log files;
+3. removes the start-at-login shortcut, if it points to this folder;
+4. **asks** whether to remove the Python packages the helper installed (about 600 MB).
+   - Answer **N** if you'll reinstall soon; the next first run is then much quicker.
+   - `numpy` and `pillow` are always kept, because other programs often use them.
+5. deletes the app files, then itself, then the folder if it's now empty.
+
+Python itself is never removed. To reinstall, download the ZIP again and run `run_first_time.bat`.
+
 ## Configuration
 
 The constants at the top of `dictation_app.py` control the behaviour:
