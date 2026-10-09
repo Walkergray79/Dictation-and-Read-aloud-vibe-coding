@@ -12,7 +12,13 @@ An offline dictation (speech-to-text) and read-aloud (text-to-speech) tool for W
 
 **Status bubble:** while the app is working, a small bubble appears near the bottom of the screen. It shows "Listening", "Writing down what you said", "Getting ready to read" and "Reading aloud (2 of 7)". It also shows short messages such as "Done" or "Nothing selected". The bubble never takes the keyboard focus, and clicks pass straight through it. You can turn it off in the tray menu.
 
-**Tray icon colour:** grey = loading · blue = ready · red = listening · amber = transcribing · green = reading.
+**Tray icon colour:** grey = loading · blue = ready · red = listening · amber = transcribing · green = reading · grey with ⏸ = paused. No icon means the helper isn't running.
+
+**Pause:** **left-click** the tray icon (or choose *Pause* in its menu) to turn the hotkeys off. F9, F10 and Esc then work as normal keys in other apps. Click again to turn the helper back on. It always starts switched on.
+
+**Keeping the icon visible:**
+- On **Windows 11**, the helper pins its tray icon to the taskbar automatically the first time it runs, so it isn't hidden under the **^** arrow. If the icon disappears after a Python update, choose **Pin icon to taskbar** from its menu.
+- On **Windows 10**, drag the icon from the **^** pop-up onto the taskbar once.
 
 Right-click the tray icon to:
 - choose the **microphone**, **reading voice**, **reading speed** and **dictation model** (Fast `base.en` / Accurate `small.en`);

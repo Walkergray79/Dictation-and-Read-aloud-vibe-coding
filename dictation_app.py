@@ -219,6 +219,7 @@ class Settings:
         self.whisper_model = DEFAULT_WHISPER_MODEL
         self.output_mode = DEFAULT_OUTPUT_MODE
         self.show_bubble = True
+        self.auto_pin_done = False  # tray icon auto-pinned once (Windows 11)
         try:
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
             for key in self.__dict__:
@@ -853,10 +854,11 @@ class HotkeyListener:
     onto a queue; the App's controller thread does the real work.
     On Windows our hotkeys are swallowed so F10 doesn't open app menus, etc."""
 
-    def __init__(self, events: queue.Queue, is_busy):
+    def __init__(self, events: queue.Queue, is_busy, is_paused):
         self.events = events
-        self.is_busy = is_busy  # callable -> True while recording/speaking
-        self._down = set()
+        self.is_busy = is_busy      # callable -> True while recording/speaking
+        self.is_paused = is_paused  # callable -> True when hotkeys are paused
+        self._down = set()          # hotkeys whose key-down we took (and swallowed)
         self._listener = None
 
     def start(self):
@@ -876,26 +878,30 @@ class HotkeyListener:
         return self._listener is not None and self._listener.is_alive()
 
     def _emit(self, name: str, is_down: bool) -> bool:
-        """Translate key edges into app events. Returns True to swallow the key."""
-        if is_down:
-            if name in self._down:      # auto-repeat while held - ignore
-                return True
-            self._down.add(name)
-        else:
+        """Translate key edges into app events. Returns True to swallow the key.
+        A key-up is only swallowed if we also took its key-down, so other apps
+        never see a lone "up" or "down"."""
+        if not is_down:
+            if name not in self._down:
+                return False
             self._down.discard(name)
+            if name == "dictate":
+                self.events.put("dictate_up")
+            return True
+        if name in self._down:          # auto-repeat while held - ignore
+            return True
+        if self.is_paused():            # paused: F9/F10/Esc behave normally
+            return False
         if name == "dictate":
-            self.events.put("dictate_down" if is_down else "dictate_up")
-            return True
-        if name == "read":
-            if is_down:
-                self.events.put("read")
-            return True
-        if name == "stop":
-            if is_down and self.is_busy():
-                self.events.put("stop")
-                return True
-            return False  # Esc behaves normally when we're idle
-        return False
+            self.events.put("dictate_down")
+        elif name == "read":
+            self.events.put("read")
+        elif name == "stop":
+            if not self.is_busy():
+                return False            # Esc behaves normally when we're idle
+            self.events.put("stop")
+        self._down.add(name)
+        return True
 
     def _win32_filter(self, msg, data):
         if data.flags & LLKHF_INJECTED:      # our own simulated Ctrl+C / Ctrl+V
@@ -909,7 +915,7 @@ class HotkeyListener:
             if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
                 swallow = self._emit(name, True)
             elif msg in (WM_KEYUP, WM_SYSKEYUP):
-                swallow = self._emit(name, False) or name != "stop"
+                swallow = self._emit(name, False)
         except Exception:
             log.exception("Hotkey filter error")
         if swallow:
@@ -1085,6 +1091,50 @@ class StatusBubble:
             return None
 
 
+def pin_tray_icon() -> str:
+    """Windows 11: mark our tray icon "always show" so it sits on the taskbar
+    instead of in the ^ overflow. Per-user registry setting, no admin needed.
+    Unofficial (Windows has no API for this), so failures are harmless.
+    Returns "pinned", "not_found" (icon not registered yet) or "unsupported"."""
+    if not IS_WINDOWS:
+        return "unsupported"
+    import winreg
+
+    def value(key, name):
+        try:
+            return winreg.QueryValueEx(key, name)[0]
+        except OSError:
+            return None
+
+    try:
+        root = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\NotifyIconSettings")
+    except OSError:
+        return "unsupported"  # Windows 10 stores this in an undocumented binary blob
+    exes = {os.path.normcase(sys.executable), os.path.normcase(os.path.realpath(sys.executable))}
+    found = False
+    with root:
+        index = 0
+        while True:
+            try:
+                sub = winreg.EnumKey(root, index)
+            except OSError:
+                break
+            index += 1
+            try:
+                with winreg.OpenKey(root, sub, 0, winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
+                    tip = str(value(key, "InitialTooltip") or "")
+                    exe = os.path.normcase(str(value(key, "ExecutablePath") or ""))
+                    if APP_NAME not in tip and exe not in exes:
+                        continue
+                    found = True
+                    if value(key, "IsPromoted") != 1:
+                        winreg.SetValueEx(key, "IsPromoted", 0, winreg.REG_DWORD, 1)
+                        log.info("Tray icon set to always show (%s)", sub)
+            except OSError:
+                continue
+    return "pinned" if found else "not_found"
+
+
 # =============================================================================
 # 9. APPLICATION / CONTROLLER
 # =============================================================================
@@ -1096,6 +1146,7 @@ STATE_COLORS = {
     "preparing": (30, 160, 80),
     "speaking": (30, 160, 80),
     "error": (90, 90, 90),
+    "paused": (150, 150, 150),
 }
 STATE_LABELS = {  # tray tooltip / menu header
     "loading": "Loading speech models...",
@@ -1105,6 +1156,7 @@ STATE_LABELS = {  # tray tooltip / menu header
     "preparing": "Getting ready to read...",
     "speaking": f"Reading aloud ({READ_KEY.upper()}/{STOP_KEY.capitalize()} to stop)",
     "error": "Model loading failed - see dictation_app.log",
+    "paused": "Paused - click the icon to turn back on",
 }
 BUBBLE_TEXT = {  # on-screen status bubble; text ending in "..." gets animated dots
     "loading": "Loading speech models...",
@@ -1116,12 +1168,16 @@ BUBBLE_TEXT = {  # on-screen status bubble; text ending in "..." gets animated d
 FLASH_COLORS = {"ok": (30, 160, 80), "warn": (235, 160, 20), "error": (220, 40, 40)}
 
 
-def make_icon(color) -> Image.Image:
-    """Draw a simple microphone glyph on a coloured circle."""
+def make_icon(color, paused: bool = False) -> Image.Image:
+    """Draw a microphone glyph (or a pause sign) on a coloured circle."""
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.ellipse((2, 2, 62, 62), fill=color + (255,))
     white = (255, 255, 255, 255)
+    if paused:
+        d.rounded_rectangle((20, 16, 28, 48), radius=2, fill=white)
+        d.rounded_rectangle((36, 16, 44, 48), radius=2, fill=white)
+        return img
     d.rounded_rectangle((24, 12, 40, 38), radius=8, fill=white)
     d.arc((17, 22, 47, 46), start=0, end=180, fill=white, width=4)
     d.line((32, 46, 32, 52), fill=white, width=4)
@@ -1143,7 +1199,9 @@ class App:
         self.bubble = StatusBubble()
         self.bubble.enabled = bool(self.settings.show_bubble)
         self._detail = None
-        self.hotkeys = HotkeyListener(self.events, self.is_busy)
+        self.paused = False
+        self._load_failed = False
+        self.hotkeys = HotkeyListener(self.events, self.is_busy, lambda: self.paused)
         self._record_started = 0.0
         self._watchdog = None
         self._pending_transcriptions = 0
@@ -1165,6 +1223,8 @@ class App:
                 state = "speaking"
             elif self._pending_transcriptions > 0:
                 state = "transcribing"
+            elif self.paused:
+                state = "paused"
         if (state, detail) == (self.state, self._detail):
             return
         changed = state != self.state
@@ -1178,7 +1238,8 @@ class App:
             self.bubble.hide()
         if changed:
             try:
-                self.icon.icon = make_icon(STATE_COLORS.get(state, STATE_COLORS["idle"]))
+                self.icon.icon = make_icon(STATE_COLORS.get(state, STATE_COLORS["idle"]),
+                                           paused=(state == "paused"))
                 self.icon.title = f"{APP_NAME}\n{STATE_LABELS.get(state, state)}"[:127]
                 self.icon.update_menu()
             except Exception:
@@ -1221,6 +1282,9 @@ class App:
             return [Item(label, pick(v), checked=is_on(v), radio=True) for label, v in options]
 
         return Menu(
+            # default=True -> a left-click on the tray icon toggles pause
+            Item(lambda item: "Turn back on" if self.paused else "Pause (F9/F10 work as normal keys)",
+                 lambda icon, item: self.toggle_pause(), default=True),
             Item(lambda item: STATE_LABELS.get(self.state, self.state), None, enabled=False),
             Menu.SEPARATOR,
             Item("Microphone", Menu(mic_items)),
@@ -1232,6 +1296,8 @@ class App:
                 ("Typing (works in most apps)", "type"),
                 ("Pasting (faster for long text)", "paste")]))),
             Item("Edit custom words...", lambda icon, item: self._edit_vocab()),
+            Item("Pin icon to taskbar", lambda icon, item: threading.Thread(
+                target=self._pin_icon, args=(True,), name="tray-pin", daemon=True).start()),
             Item("Show status bubble", lambda icon, item: self._set_setting(
                 "show_bubble", not self.settings.show_bubble),
                  checked=lambda item: bool(self.settings.show_bubble)),
@@ -1253,6 +1319,56 @@ class App:
             if not value:
                 self.bubble.hide()
         self.icon.update_menu()
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+        log.info("Hotkeys %s", "paused" if self.paused else "resumed")
+        if self.paused:
+            self.speaker.stop()
+            self.events.put("cancel_recording")  # the controller thread owns the mic
+            self.hotkeys._down.clear()
+            self.set_state("idle")
+            self.flash("Paused - F9 and F10 work as normal keys", "warn")
+        else:
+            if self.stt is not None and self.tts is not None:
+                self.set_state("idle")
+            else:
+                self.set_state("error" if self._load_failed else "loading")
+            self.flash(f"On - hold {DICTATE_KEY.upper()} to dictate, {READ_KEY.upper()} to read")
+        try:
+            self.icon.update_menu()
+        except Exception:
+            pass
+
+    def _pin_icon(self, manual: bool = False):
+        """Pin the tray icon (Windows 11). Automatic once at first start; the menu
+        item re-runs it, e.g. after a Python update changed the program path."""
+        if not manual and self.settings.auto_pin_done:
+            return
+        result = "not_found"
+        for _ in range(10):  # Explorer records the icon a moment after it appears
+            time.sleep(2)
+            try:
+                result = pin_tray_icon()
+            except Exception:
+                log.exception("Pinning the tray icon failed")
+                result = "unsupported"
+            if result != "not_found":
+                break
+        if result == "pinned":
+            self.settings.auto_pin_done = True
+            self.settings.save()
+            try:  # re-add the icon so Explorer applies the setting immediately
+                self.icon.visible = False
+                time.sleep(0.5)
+                self.icon.visible = True
+            except Exception:
+                pass
+            if manual:
+                self.flash("Icon pinned to the taskbar")
+        elif manual:
+            log.info("Tray icon pinning result: %s", result)
+            self.flash("Couldn't pin automatically - drag the icon from ^", "warn")
 
     def _edit_vocab(self):
         try:
@@ -1289,6 +1405,7 @@ class App:
                         f"press {READ_KEY.upper()} to read highlighted text.")
         except Exception as exc:
             log.exception("Model loading failed")
+            self._load_failed = True
             self.set_state("error")
             if isinstance(exc, (FileNotFoundError, OSError)) and getattr(exc, "winerror", None) in (3, 206):
                 hint = ("The folder path is too long for Windows. Move the app to a short folder "
@@ -1323,7 +1440,8 @@ class App:
         for target, name in ((self._controller_loop, "controller"),
                              (self._transcribe_loop, "transcriber"),
                              (self._load_models, "model-loader"),
-                             (self._hook_health_loop, "hook-health")):
+                             (self._hook_health_loop, "hook-health"),
+                             (self._pin_icon, "tray-pin")):
             threading.Thread(target=target, name=name, daemon=True).start()
         self.hotkeys.start()
 
@@ -1352,7 +1470,7 @@ class App:
             if self._running and not self.hotkeys.alive():
                 log.warning("Hotkey listener stopped - restarting it")
                 try:
-                    self.hotkeys = HotkeyListener(self.events, self.is_busy)
+                    self.hotkeys = HotkeyListener(self.events, self.is_busy, lambda: self.paused)
                     self.hotkeys.start()
                 except Exception:
                     log.exception("Could not restart hotkey listener")
@@ -1370,6 +1488,7 @@ class App:
                     "dictate_timeout": self._on_dictate_timeout,
                     "read": self._on_read,
                     "stop": self._on_stop,
+                    "cancel_recording": self._cancel_recording,
                 }[event]
                 handler()
             except Exception:
@@ -1459,15 +1578,18 @@ class App:
             text = text[:MAX_READ_CHARS]
         self.speaker.speak(text)
 
+    def _cancel_recording(self):
+        if self.recorder.active:
+            self._finish_recording()
+            chime("stop")
+            log.info("Dictation cancelled")
+            self.set_state("idle")
+
     def _on_stop(self):
         if self.speaker.busy:
             self.speaker.stop()
         elif self.recorder.active:  # Esc while dictating = cancel
-            self._finish_recording()
-            self.hotkeys._down.discard("dictate")
-            chime("stop")
-            log.info("Dictation cancelled")
-            self.set_state("idle")
+            self._cancel_recording()
 
     def _transcribe_loop(self):
         """Runs Whisper off the hook/tray threads; one recording at a time, in order."""
