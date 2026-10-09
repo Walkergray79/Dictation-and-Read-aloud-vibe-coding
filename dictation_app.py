@@ -97,6 +97,7 @@ _bootstrap()
 # =============================================================================
 # 1. IMPORTS & CONFIGURATION
 # =============================================================================
+import ctypes
 import io
 import json
 import logging
@@ -114,6 +115,7 @@ APP_NAME = "Dictation & Read-Aloud Helper"
 APP_DIR = Path(__file__).resolve().parent
 CACHE_DIR = APP_DIR / ".cache"
 SETTINGS_FILE = APP_DIR / "settings.json"
+VOCAB_FILE = APP_DIR / "custom_words.txt"
 LOG_FILE = APP_DIR / "dictation_app.log"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -135,11 +137,19 @@ DEFAULT_WHISPER_MODEL = "base.en"
 SAMPLE_RATE = 16000              # Whisper expects 16 kHz mono
 MIN_RECORD_SECONDS = 0.3         # ignore accidental taps
 MAX_RECORD_SECONDS = 120         # watchdog in case the key-up event is lost
-OUTPUT_MODE = "paste"            # "paste" (fast, clipboard + Ctrl+V) or "type" (key by key)
+# How dictated text goes into the focused app (switchable from the tray menu):
+#   "type"  - simulated key presses; works almost everywhere, never touches the clipboard
+#   "paste" - clipboard + Ctrl+V; faster for long text, but some apps read the clipboard late
+DEFAULT_OUTPUT_MODE = "type"
+PASTE_RESTORE_DELAY = 1.0        # seconds to wait before putting the old clipboard back
 
 # ---- Text-to-speech ----------------------------------------------------------
 KOKORO_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
-KOKORO_FILES = ["kokoro-v1.0.int8.onnx", "voices-v1.0.bin"]  # int8 = ~90 MB, CPU friendly
+# Full-precision model (~325 MB). The int8 variant is smaller but ~6x SLOWER on CPUs
+# (its quantised ops aren't optimised in ONNX Runtime), so it's only a fallback.
+KOKORO_MODEL = "kokoro-v1.0.onnx"
+KOKORO_MODEL_FALLBACK = "kokoro-v1.0.int8.onnx"
+KOKORO_VOICES = "voices-v1.0.bin"
 VOICES = {
     "Heart (US, female)": "af_heart",
     "Bella (US, female)": "af_bella",
@@ -151,6 +161,7 @@ VOICES = {
 DEFAULT_VOICE = "af_heart"
 SPEEDS = [0.8, 0.9, 1.0, 1.1, 1.25, 1.5]
 MAX_READ_CHARS = 20000
+FIRST_CHUNK_CHARS = 90                 # short first sentence -> speech starts within ~1 s
 READ_CLIPBOARD_IF_NO_SELECTION = True  # F10 with nothing highlighted reads the clipboard
 
 IS_WINDOWS = sys.platform == "win32"
@@ -199,16 +210,18 @@ if IS_WINDOWS:
 # 2. SETTINGS
 # =============================================================================
 class Settings:
-    """Tiny JSON-backed settings store (mic, voice, speed, model)."""
+    """Tiny JSON-backed settings store (mic, voice, speed, model, ...)."""
 
     def __init__(self):
         self.mic = None  # None = system default; otherwise the device *name*
         self.voice = DEFAULT_VOICE
         self.speed = 1.0
         self.whisper_model = DEFAULT_WHISPER_MODEL
+        self.output_mode = DEFAULT_OUTPUT_MODE
+        self.show_bubble = True
         try:
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            for key in ("mic", "voice", "speed", "whisper_model"):
+            for key in self.__dict__:
                 if key in data:
                     setattr(self, key, data[key])
         except FileNotFoundError:
@@ -250,6 +263,7 @@ CHIMES = {
     "stop": _make_wav([(523, 0.06), (392, 0.10)]),     # short, low, falling
     "success": _make_wav([(1046, 0.05), (1568, 0.12)], volume=0.18),  # bright "pop"
     "error": _make_wav([(220, 0.12), (196, 0.18)]),    # low double "bonk"
+    "read": _make_wav([(784, 0.08)], volume=0.15),     # soft single tick: "F10 heard"
 }
 
 
@@ -303,23 +317,60 @@ def press_combo(modifier, key) -> None:
         _kb.release(modifier)  # never leave Ctrl stuck down
 
 
-def output_text(text: str) -> bool:
+def foreground_window_title() -> str:
+    """Title of the window that will receive dictated text (for the log)."""
+    if not IS_WINDOWS:
+        return "?"
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, buf, 256)
+        return buf.value or f"(untitled window {hwnd})"
+    except Exception:
+        return "?"
+
+
+def wait_for_modifiers_released(timeout: float = 1.5) -> None:
+    """Don't inject text while the user still holds Ctrl/Alt/Shift/Win, or the
+    letters would turn into shortcuts (Ctrl+S, Alt+F...)."""
+    if not IS_WINDOWS:
+        return
+    get_state = ctypes.windll.user32.GetAsyncKeyState
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not any(get_state(vk) & 0x8000 for vk in (0x10, 0x11, 0x12, 0x5B, 0x5C)):
+            return
+        time.sleep(0.02)
+
+
+def type_text(text: str) -> None:
+    for ch in text:
+        _kb.type(ch)
+        time.sleep(0.004)  # tiny gap so busy apps (Word, Teams) don't drop keys
+
+
+def output_text(text: str, mode: str) -> None:
     """Insert text into the currently focused window."""
-    if OUTPUT_MODE == "type":
-        _kb.type(text)
-        return True
+    wait_for_modifiers_released()
+    log.info("Inserting %d chars by %s into: %s", len(text),
+             "typing" if mode == "type" else "pasting", foreground_window_title())
+    if mode == "type":
+        type_text(text)
+        return
     with _clipboard_lock:
         saved = clip_get()
         if not clip_set(text):
             log.warning("Clipboard busy; falling back to typing")
-            _kb.type(text)
-            return True
+            type_text(text)
+            return
         time.sleep(0.05)
         press_combo(keyboard.Key.ctrl, "v")
-        time.sleep(0.3)  # let the target app read the clipboard before restoring
+        # Office, browsers and Teams read the clipboard lazily; restoring too soon
+        # makes them paste the *old* clipboard (or nothing).
+        time.sleep(PASTE_RESTORE_DELAY)
         if saved is not None:
             clip_set(saved)
-    return True
 
 
 def copy_selection() -> str:
@@ -343,6 +394,135 @@ def copy_selection() -> str:
         log.info("Nothing highlighted; reading the clipboard instead")
         text = saved
     return text.strip()
+
+
+# =============================================================================
+# 4b. CUSTOM WORDS (dictation spellings, fix-ups, read-aloud pronunciations)
+# =============================================================================
+VOCAB_TEMPLATE = """\
+# Custom words for the Dictation & Read-Aloud Helper.
+# Edit, then save this file - changes apply straight away, no restart needed.
+# Lines starting with # are notes and are ignored.
+#
+# 1) WORDS TO RECOGNISE - one per line. Helps dictation spell them correctly.
+#    Acronyms (all capitals) are also fixed when dictation spells them out,
+#    e.g. "N M U K" or "N.M.U.K." becomes "NMUK".
+NMUK
+#
+# 2) FIX-UPS - what dictation wrote  ->  what you want instead
+#    (whole words, upper/lower case doesn't matter). Example:
+# share point -> SharePoint
+#
+# 3) READ-ALOUD PRONUNCIATION - word  =  how to say it (matches the word exactly)
+NMUK = N M U K
+"""
+
+
+class Vocabulary:
+    """Loads custom_words.txt and re-reads it whenever the file changes."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._mtime = None
+        self._lock = threading.Lock()
+        self.words, self.fixups, self.say = [], [], []
+        try:
+            if not path.exists():
+                path.write_text(VOCAB_TEMPLATE, encoding="utf-8")
+        except OSError as exc:
+            log.warning("Could not create %s: %s", path.name, exc)
+
+    def _refresh(self):
+        try:
+            mtime = self.path.stat().st_mtime
+        except OSError:
+            return
+        if mtime == self._mtime:
+            return
+        words, fixups, say = [], [], []
+        try:
+            for raw in self.path.read_text(encoding="utf-8-sig").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "->" in line:
+                    heard, wanted = (x.strip() for x in line.split("->", 1))
+                    if heard and wanted:
+                        fixups.append((re.compile(r"(?<!\w)" + re.escape(heard) + r"(?!\w)",
+                                                  re.IGNORECASE), wanted))
+                elif "=" in line:
+                    word, spoken = (x.strip() for x in line.split("=", 1))
+                    if word and spoken:
+                        say.append((re.compile(r"(?<!\w)" + re.escape(word) + r"(?!\w)"), spoken))
+                        words.append(word)  # a word worth pronouncing is worth spelling too
+                else:
+                    words.append(line)
+        except Exception as exc:
+            log.warning("Could not read %s: %s", self.path.name, exc)
+            return
+        self.words = list(dict.fromkeys(words))  # de-duplicate, keep order
+        self.fixups, self.say, self._mtime = fixups, say, mtime
+        log.info("Custom words loaded: %d words, %d fix-ups, %d pronunciations",
+                 len(self.words), len(fixups), len(say))
+
+    def prompt(self):
+        """Hint text for Whisper so it prefers these spellings (None if no words)."""
+        with self._lock:
+            self._refresh()
+            words = self.words
+        if not words:
+            return None
+        hint = ", ".join(words)
+        return hint[:400] + "."
+
+    @staticmethod
+    def _acronym_fixer(word):
+        letters = [re.escape(ch) for ch in word]
+        pattern = re.compile(r"(?<!\w)" + r"[\s.\-]*".join(letters) + r"(?P<dot>\.)?(?!\w)",
+                             re.IGNORECASE)
+
+        def replace(m):
+            found = m.group(0)
+            core = found[:-1] if m.group("dot") else found
+            if core.isalpha() and core.islower():
+                return found  # plain lowercase word ("it", "who") - leave alone
+            if m.group("dot"):
+                rest = m.string[m.end():]
+                # keep a full stop that really ends the sentence
+                if not rest.strip() or re.match(r"\s+[A-Z]", rest):
+                    return word + "."
+            return word
+        return pattern, replace
+
+    def fix(self, text: str) -> str:
+        """Apply fix-ups and acronym clean-up to dictated text."""
+        with self._lock:
+            self._refresh()
+            fixups, words = self.fixups, self.words
+        for pattern, wanted in fixups:
+            text = pattern.sub(wanted, text)
+        for word in words:
+            if len(word) >= 2 and word.isalpha() and word.isupper():
+                pattern, replace = self._acronym_fixer(word)
+                text = pattern.sub(replace, text)
+        return text
+
+    def pronounce(self, text: str) -> str:
+        """Swap words for their spoken form before reading aloud."""
+        with self._lock:
+            self._refresh()
+            say = self.say
+        for pattern, spoken in say:
+            text = pattern.sub(spoken, text)
+        return text
+
+    def open_in_editor(self):
+        if not self.path.exists():
+            self.path.write_text(VOCAB_TEMPLATE, encoding="utf-8")
+        if IS_WINDOWS:
+            os.startfile(str(self.path))  # opens in Notepad (or the default .txt editor)
+        else:
+            log.info("Edit your custom words in %s", self.path)
 
 
 # =============================================================================
@@ -389,11 +569,21 @@ def load_kokoro():
 
     folder = CACHE_DIR / "kokoro"
     folder.mkdir(parents=True, exist_ok=True)
-    for name in KOKORO_FILES:
-        path = folder / name
-        if not path.exists():
-            download_file(KOKORO_URL + name, path)
-    return Kokoro(str(folder / KOKORO_FILES[0]), str(folder / KOKORO_FILES[1]))
+    voices = folder / KOKORO_VOICES
+    if not voices.exists():
+        download_file(KOKORO_URL + KOKORO_VOICES, voices)
+    model = folder / KOKORO_MODEL
+    if not model.exists():
+        try:
+            download_file(KOKORO_URL + KOKORO_MODEL, model)
+        except Exception as exc:
+            fallback = folder / KOKORO_MODEL_FALLBACK
+            if not fallback.exists():
+                raise
+            log.warning("Could not download %s (%s); using the slower %s for now",
+                        KOKORO_MODEL, exc, KOKORO_MODEL_FALLBACK)
+            model = fallback
+    return Kokoro(str(model), str(voices))
 
 
 # =============================================================================
@@ -507,20 +697,26 @@ def prepare_text(text: str) -> str:
     return re.sub(r"\s+", " ", out).strip()
 
 
-def split_chunks(text: str, max_len: int = 300):
-    """Split into sentence-sized chunks so playback starts fast and stops fast."""
-    sentences = re.split(r"(?<=[.!?…])\s+", text)
+def _cut(s: str, limit: int):
+    """Split s near `limit` chars, preferring a comma, then a space."""
+    cut = s.rfind(", ", 0, limit)
+    if cut < limit // 3:
+        cut = s.rfind(" ", 0, limit)
+    if cut <= 0:
+        cut = limit
+    return s[:cut + 1].strip(), s[cut + 1:].strip()
+
+
+def split_chunks(text: str, max_len: int = 250, first_len: int = FIRST_CHUNK_CHARS):
+    """Split into sentence-sized chunks so playback starts fast and stops fast.
+    The first chunk is kept extra short: speech can only start once it has been
+    synthesised, and later chunks are generated while earlier ones play."""
     pieces = []
-    for s in sentences:
+    for s in re.split(r"(?<=[.!?\u2026])\s+", text):
         s = s.strip()
         while len(s) > max_len:  # very long sentence: cut at a comma or space
-            cut = s.rfind(", ", 0, max_len)
-            if cut < max_len // 3:
-                cut = s.rfind(" ", 0, max_len)
-            if cut <= 0:
-                cut = max_len
-            pieces.append(s[:cut + 1].strip())
-            s = s[cut + 1:].strip()
+            head, s = _cut(s, max_len)
+            pieces.append(head)
         if s:
             pieces.append(s)
     chunks = []
@@ -529,6 +725,9 @@ def split_chunks(text: str, max_len: int = 300):
             chunks[-1] += " " + p
         else:
             chunks.append(p)
+    if chunks and len(chunks[0]) > first_len:
+        head, tail = _cut(chunks[0], first_len)
+        chunks[0:1] = [c for c in (head, tail) if c]
     return chunks
 
 
@@ -584,10 +783,11 @@ class Speaker:
             out_q.put(None)
 
     def _run(self, text: str, stop: threading.Event):
-        self.app.set_state("speaking")
+        self.app.set_state("preparing")
         stream = None
+        played = 0
         try:
-            chunks = split_chunks(prepare_text(text))
+            chunks = split_chunks(self.app.vocab.pronounce(prepare_text(text)))
             log.info("Reading %d characters in %d chunk(s)", len(text), len(chunks))
             q = queue.Queue(maxsize=4)
             threading.Thread(target=self._synth, args=(chunks, q, stop),
@@ -600,6 +800,8 @@ class Speaker:
                     continue
                 if item is None:
                     break
+                played += 1
+                self.app.set_state("speaking", f"{played} of {len(chunks)}" if len(chunks) > 1 else None)
                 audio, sr = item
                 if stream is None:
                     try:
@@ -736,6 +938,154 @@ class HotkeyListener:
 
 
 # =============================================================================
+# 8b. STATUS BUBBLE (on-screen feedback, like the Win+H toolbar)
+# =============================================================================
+class StatusBubble:
+    """A small always-on-top pill near the bottom of the screen showing what the
+    app is doing ("Listening...", "Getting ready to read...").
+
+    It is built so it can never get in the way of dictation:
+      * it never takes keyboard focus (WS_EX_NOACTIVATE), so typing still goes
+        to the app you were in;
+      * mouse clicks pass straight through it (WS_EX_TRANSPARENT);
+      * it has no taskbar button (WS_EX_TOOLWINDOW).
+    Tk runs on its own thread; other threads only post messages to a queue.
+    If tkinter isn't available (e.g. the embeddable Python), it quietly does nothing."""
+
+    BG = "#202124"
+    FG = "#ffffff"
+
+    def __init__(self):
+        self._q = queue.Queue()
+        self.enabled = True
+        threading.Thread(target=self._run, name="status-bubble", daemon=True).start()
+
+    # ---- thread-safe API ----------------------------------------------------
+    def show(self, text: str, color, animate: bool = True):
+        self._q.put(("show", text, color, animate, None))
+
+    def flash(self, text: str, color, seconds: float = 1.6):
+        self._q.put(("show", text, color, False, seconds))
+
+    def hide(self):
+        self._q.put(("hide",))
+
+    # ---- Tk thread ------------------------------------------------------------
+    def _run(self):
+        try:
+            import tkinter as tk
+            import tkinter.font as tkfont
+        except Exception:
+            log.info("tkinter not available - status bubble disabled (tray icon still works)")
+            return
+        try:
+            root = tk.Tk()
+            root.overrideredirect(True)
+            root.configure(bg=self.BG)
+            root.attributes("-topmost", True)
+            root.attributes("-alpha", 0.0)  # invisible until styled and needed
+            font = tkfont.Font(family="Segoe UI", size=13)
+            frame = tk.Frame(root, bg=self.BG, padx=16, pady=9)
+            frame.pack()
+            dot = tk.Canvas(frame, width=16, height=16, bg=self.BG, highlightthickness=0)
+            dot.pack(side="left", padx=(0, 10))
+            oval = dot.create_oval(2, 2, 14, 14, fill="#888888", outline="")
+            # Fixed width (in characters) so the window never needs resizing later.
+            label = tk.Label(frame, text="", width=42, anchor="w", font=font,
+                             fg=self.FG, bg=self.BG)
+            label.pack(side="left")
+            root.update_idletasks()
+            w, h = root.winfo_reqwidth(), root.winfo_reqheight()
+            sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+            root.geometry(f"{w}x{h}+{(sw - w) // 2}+{sh - h - 110}")
+            root.update()
+            hwnd = self._win32_style(root)
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+            else:
+                root.withdraw()
+                root.attributes("-alpha", 0.92)
+        except Exception:
+            log.exception("Could not create status bubble")
+            return
+
+        state = {"text": "", "color": (128, 128, 128), "animate": False,
+                 "tick": 0, "hide_at": None, "visible": False}
+
+        def set_visible(on):
+            if on == state["visible"]:
+                return
+            state["visible"] = on
+            if hwnd:
+                user32 = ctypes.windll.user32
+                if on:  # show + stay on top WITHOUT activating (focus stays in your app)
+                    user32.ShowWindow(hwnd, 4)  # SW_SHOWNOACTIVATE
+                    user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+                else:
+                    user32.ShowWindow(hwnd, 0)
+            elif on:
+                root.deiconify()
+            else:
+                root.withdraw()
+
+        def poll():
+            try:
+                while True:
+                    msg = self._q.get_nowait()
+                    if msg[0] == "hide" or not self.enabled:
+                        if msg[0] == "hide" and state["hide_at"] and self.enabled:
+                            continue  # let a "Done"/"Nothing selected" flash finish
+                        state["hide_at"] = None
+                        set_visible(False)
+                        continue
+                    _, text, color, animate, seconds = msg
+                    state.update(text=text, color=color, animate=animate, tick=0,
+                                 hide_at=(time.time() + seconds) if seconds else None)
+                    label.configure(text=text)
+                    dot.itemconfigure(oval, fill="#%02x%02x%02x" % color)
+                    set_visible(True)
+            except queue.Empty:
+                pass
+            except Exception:
+                log.exception("Status bubble error")
+            if state["hide_at"] and time.time() >= state["hide_at"]:
+                state["hide_at"] = None
+                set_visible(False)
+            if state["visible"] and state["animate"]:
+                # gentle pulse + animated dots so it's obvious the app is alive
+                state["tick"] += 1
+                phase = (state["tick"] % 12) / 12.0
+                k = 0.55 + 0.45 * abs(1 - 2 * phase)
+                r, g, b = state["color"]
+                dot.itemconfigure(oval, fill="#%02x%02x%02x" % (int(r * k), int(g * k), int(b * k)))
+                base = state["text"].rstrip(".…")
+                if base != state["text"]:
+                    label.configure(text=base + "." * (1 + (state["tick"] // 4) % 3))
+            root.after(80, poll)
+
+        root.after(80, poll)
+        root.mainloop()
+
+    @staticmethod
+    def _win32_style(root):
+        if not IS_WINDOWS:
+            return None
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
+            GWL_EXSTYLE = -20
+            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            ex |= 0x08000000 | 0x00000080 | 0x00000020 | 0x00080000 | 0x00000008
+            #     NOACTIVATE   TOOLWINDOW   TRANSPARENT  LAYERED      TOPMOST
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex)
+            user32.SetLayeredWindowAttributes(hwnd, 0, 235, 0x2)  # LWA_ALPHA: slightly see-through
+            return hwnd
+        except Exception:
+            log.exception("Could not style status bubble")
+            return None
+
+
+# =============================================================================
 # 9. APPLICATION / CONTROLLER
 # =============================================================================
 STATE_COLORS = {
@@ -743,17 +1093,27 @@ STATE_COLORS = {
     "idle": (40, 110, 220),
     "recording": (220, 40, 40),
     "transcribing": (235, 160, 20),
+    "preparing": (30, 160, 80),
     "speaking": (30, 160, 80),
     "error": (90, 90, 90),
 }
-STATE_LABELS = {
+STATE_LABELS = {  # tray tooltip / menu header
     "loading": "Loading speech models...",
     "idle": f"Ready - hold {DICTATE_KEY.upper()} to dictate, {READ_KEY.upper()} to read",
     "recording": "Listening...",
     "transcribing": "Transcribing...",
+    "preparing": "Getting ready to read...",
     "speaking": f"Reading aloud ({READ_KEY.upper()}/{STOP_KEY.capitalize()} to stop)",
     "error": "Model loading failed - see dictation_app.log",
 }
+BUBBLE_TEXT = {  # on-screen status bubble; text ending in "..." gets animated dots
+    "loading": "Loading speech models...",
+    "recording": f"Listening - let go of {DICTATE_KEY.upper()} when done",
+    "transcribing": "Writing down what you said...",
+    "preparing": "Getting ready to read...",
+    "speaking": f"Reading aloud - {STOP_KEY.capitalize()} to stop",
+}
+FLASH_COLORS = {"ok": (30, 160, 80), "warn": (235, 160, 20), "error": (220, 40, 40)}
 
 
 def make_icon(color) -> Image.Image:
@@ -775,11 +1135,14 @@ class App:
         self.stt = None
         self.tts = None
         self.state = "loading"
-        self._busy_state = None  # state to return to when speech/transcription ends
         self.events = queue.Queue()
         self.transcribe_q = queue.Queue()
         self.recorder = Recorder()
         self.speaker = Speaker(self)
+        self.vocab = Vocabulary(VOCAB_FILE)
+        self.bubble = StatusBubble()
+        self.bubble.enabled = bool(self.settings.show_bubble)
+        self._detail = None
         self.hotkeys = HotkeyListener(self.events, self.is_busy)
         self._record_started = 0.0
         self._watchdog = None
@@ -793,7 +1156,7 @@ class App:
     def is_busy(self) -> bool:
         return self.recorder.active or self.speaker.busy
 
-    def set_state(self, state: str):
+    def set_state(self, state: str, detail=None):
         # When one activity ends, show whichever other activity is still running.
         if state == "idle":
             if self.recorder.active:
@@ -802,15 +1165,28 @@ class App:
                 state = "speaking"
             elif self._pending_transcriptions > 0:
                 state = "transcribing"
-        if state == self.state:
+        if (state, detail) == (self.state, self._detail):
             return
-        self.state = state
-        try:
-            self.icon.icon = make_icon(STATE_COLORS.get(state, STATE_COLORS["idle"]))
-            self.icon.title = f"{APP_NAME}\n{STATE_LABELS.get(state, state)}"[:127]
-            self.icon.update_menu()
-        except Exception:
-            pass
+        changed = state != self.state
+        self.state, self._detail = state, detail
+        text = BUBBLE_TEXT.get(state)
+        if text:
+            if detail:
+                text = f"{text}  ({detail})"
+            self.bubble.show(text, STATE_COLORS[state])
+        elif state == "idle":
+            self.bubble.hide()
+        if changed:
+            try:
+                self.icon.icon = make_icon(STATE_COLORS.get(state, STATE_COLORS["idle"]))
+                self.icon.title = f"{APP_NAME}\n{STATE_LABELS.get(state, state)}"[:127]
+                self.icon.update_menu()
+            except Exception:
+                pass
+
+    def flash(self, text: str, kind: str = "ok"):
+        """Brief message in the status bubble (e.g. "Done", "Nothing selected")."""
+        self.bubble.flash(text, FLASH_COLORS[kind], 1.2 if kind == "ok" else 2.5)
 
     def notify(self, message: str):
         try:
@@ -852,6 +1228,13 @@ class App:
             Item("Reading speed", Menu(lambda: choice_items(
                 "speed", [(f"{s:g}x", s) for s in SPEEDS]))),
             Item("Dictation model", Menu(lambda: choice_items("whisper_model", WHISPER_MODELS.items()))),
+            Item("Insert dictated text by", Menu(lambda: choice_items("output_mode", [
+                ("Typing (works in most apps)", "type"),
+                ("Pasting (faster for long text)", "paste")]))),
+            Item("Edit custom words...", lambda icon, item: self._edit_vocab()),
+            Item("Show status bubble", lambda icon, item: self._set_setting(
+                "show_bubble", not self.settings.show_bubble),
+                 checked=lambda item: bool(self.settings.show_bubble)),
             Menu.SEPARATOR,
             Item("Stop reading", lambda icon, item: self.speaker.stop(),
                  enabled=lambda item: self.speaker.busy),
@@ -865,7 +1248,18 @@ class App:
         log.info("Setting %s = %r", key, value)
         if key == "whisper_model" and value != old:
             threading.Thread(target=self._reload_whisper, name="model-loader", daemon=True).start()
+        if key == "show_bubble":
+            self.bubble.enabled = bool(value)
+            if not value:
+                self.bubble.hide()
         self.icon.update_menu()
+
+    def _edit_vocab(self):
+        try:
+            self.vocab.open_in_editor()
+        except Exception as exc:
+            log.exception("Could not open custom words file")
+            self.notify(f"Could not open {VOCAB_FILE.name}: {exc}")
 
     def _refresh_devices(self):
         if self.recorder.active or self.speaker.busy:
@@ -890,6 +1284,7 @@ class App:
             log.info("Kokoro TTS ready")
             self.set_state("idle")
             chime("success")
+            self.flash(f"Ready - hold {DICTATE_KEY.upper()} to dictate, {READ_KEY.upper()} to read")
             self.notify(f"Ready! Hold {DICTATE_KEY.upper()} to dictate, "
                         f"press {READ_KEY.upper()} to read highlighted text.")
         except Exception as exc:
@@ -901,6 +1296,7 @@ class App:
             else:
                 hint = "Connect to the internet for the first run, then restart the app."
             log.error("STARTUP FAILED: %s", hint)
+            self.flash("Could not load models - see the log", "error")
             self.notify(f"Could not load speech models. {hint}")
 
     def _reload_whisper(self):
@@ -917,6 +1313,7 @@ class App:
 
     def _setup(self, icon):
         icon.visible = True
+        self.bubble.show(BUBBLE_TEXT["loading"], STATE_COLORS["loading"])
         if IS_WINDOWS and len(str(APP_DIR)) > LONG_PATH_WARNING:
             log.warning("App folder path is %d characters long: %s", len(str(APP_DIR)), APP_DIR)
             log.warning("Windows limits paths to 260 characters. If model loading fails, move "
@@ -992,6 +1389,7 @@ class App:
         except Exception as exc:
             log.exception("Could not open microphone")
             chime("error")
+            self.flash("Microphone problem - check the tray menu", "error")
             self.notify(f"Microphone error: {exc}")
             return
         chime("start")
@@ -1032,12 +1430,16 @@ class App:
         if self.speaker.busy:  # F10 again = stop
             self.speaker.stop()
             return
+        if self.state == "preparing":  # still copying the selection - ignore double-press
+            return
         if self.tts is None:
             chime("error")
             self.notify("Still loading speech models - please wait a moment.")
             return
         if self.recorder.active:
             return
+        chime("read")                # instant "I heard you"...
+        self.set_state("preparing")  # ...and the bubble appears before any slow work
         threading.Thread(target=self._read_selection, name="reader", daemon=True).start()
 
     def _read_selection(self):
@@ -1049,6 +1451,8 @@ class App:
         if not text:
             chime("error")
             log.info("Nothing to read (no selection, clipboard empty)")
+            self.flash("Nothing selected - highlight text first", "warn")
+            self.set_state("idle")
             return
         if len(text) > MAX_READ_CHARS:
             self.notify(f"Long selection - reading the first {MAX_READ_CHARS:,} characters.")
@@ -1074,23 +1478,30 @@ class App:
             try:
                 text = self._transcribe(audio)
                 if text:
-                    output_text(text + " ")
+                    output_text(text + " ", self.settings.output_mode)
                     chime("success")
+                    self.flash("Done")
+                elif text is None:
+                    chime("error")
+                    self.flash("No sound from mic - check the tray menu", "error")
                 else:
                     log.info("No speech recognised")
                     chime("error")
+                    self.flash("Didn't catch that - please try again", "warn")
             except Exception:
                 log.exception("Transcription/typing failed")
                 chime("error")
+                self.flash("Something went wrong - see the log", "error")
             finally:
                 with self._pending_lock:
                     self._pending_transcriptions -= 1
                 self.set_state("idle")
 
-    def _transcribe(self, audio: np.ndarray) -> str:
+    def _transcribe(self, audio: np.ndarray):
+        """Returns the text, "" if no speech was recognised, or None if the mic was silent."""
         if float(np.max(np.abs(audio))) < 0.002:
             log.info("Recording is silent - is the right microphone selected / unmuted?")
-            return ""
+            return None
         start = time.time()
         model_name = self.settings.whisper_model
         segments, _info = self.stt.transcribe(
@@ -1101,9 +1512,10 @@ class App:
             vad_parameters={"min_silence_duration_ms": 500},
             condition_on_previous_text=False,
             without_timestamps=True,
+            initial_prompt=self.vocab.prompt(),    # custom words -> preferred spellings
         )
         text = " ".join(seg.text.strip() for seg in segments).strip()
-        text = re.sub(r"\s+", " ", text)
+        text = self.vocab.fix(re.sub(r"\s+", " ", text))
         log.info("Transcribed %.1fs of audio in %.1fs: %r",
                  audio.size / SAMPLE_RATE, time.time() - start, text)
         return text
@@ -1116,13 +1528,17 @@ def _single_instance() -> bool:
     """Prevent two copies typing everything twice."""
     if not IS_WINDOWS:
         return True
-    import ctypes
     global _MUTEX
     _MUTEX = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\DictationReadAloudHelper")
     return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
 
 
 def main():
+    if IS_WINDOWS:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
     if not _single_instance():
         log.info("Another instance is already running - exiting.")
         return

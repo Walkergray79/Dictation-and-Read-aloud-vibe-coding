@@ -5,3 +5,4 @@ settings.json
 dictation_app.log*
 .venv/
 python/
+custom_words.txt

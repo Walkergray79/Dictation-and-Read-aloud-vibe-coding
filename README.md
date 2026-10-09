@@ -10,17 +10,38 @@ An offline dictation (speech-to-text) and read-aloud (text-to-speech) tool for W
 
 **Chimes:** high rising = recording started · low falling = recording stopped · bright pop = text typed · low "bonk" = nothing heard, nothing selected, or an error.
 
+**Status bubble:** while the app is working, a small bubble appears near the bottom of the screen. It shows "Listening", "Writing down what you said", "Getting ready to read" and "Reading aloud (2 of 7)". It also shows short messages such as "Done" or "Nothing selected". The bubble never takes the keyboard focus, and clicks pass straight through it. You can turn it off in the tray menu.
+
 **Tray icon colour:** grey = loading · blue = ready · red = listening · amber = transcribing · green = reading.
 
-Right-click the tray icon to choose the **microphone**, **reading voice**, **reading speed**, **dictation model** (Fast `base.en` / Accurate `small.en`), or to **Quit**. Your choices are saved in `settings.json`.
+Right-click the tray icon to:
+- choose the **microphone**, **reading voice**, **reading speed** and **dictation model** (Fast `base.en` / Accurate `small.en`);
+- choose how dictated text is inserted: **Typing** (default; works in most apps) or **Pasting** (faster for long text);
+- **Edit custom words**;
+- turn the status bubble on or off;
+- **Quit**.
+
+Your choices are saved in `settings.json`.
+
+## Custom words (acronyms, names, jargon)
+
+Choose **Edit custom words...** from the tray menu. `custom_words.txt` opens in Notepad. Changes apply as soon as you save; you don't need to restart. There are three kinds of line:
+
+```
+NMUK                     <- a word to recognise: dictation will prefer this spelling
+share point -> SharePoint <- a fix-up: replace what dictation wrote with what you want
+NMUK = N M U K           <- a pronunciation: how read-aloud should say the word
+```
+
+Acronyms in capitals are also fixed when dictation spells them out. For example, "N M U K", "N.M.U.K." and "NM UK" all become "NMUK". Ordinary lowercase words are left alone, so adding `IT` won't change "it".
 
 ## Engines
 
 - **STT:** [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2) running on the CPU with INT8. It has no PyTorch dependency. Voice-activity detection removes silence, which cuts down on made-up text.
-- **TTS:** [kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx), a neural voice. It uses the INT8 model (about 90 MB) on ONNX Runtime and bundles its own espeak-ng, so nothing needs to be installed system-wide.
+- **TTS:** [kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx), a neural voice. It uses the full-precision model (about 325 MB) on ONNX Runtime and bundles its own espeak-ng, so nothing needs to be installed system-wide. The smaller INT8 model is about 6× *slower* on CPUs, so it's only used if the full model can't be downloaded. The first sentence is kept short, so speech starts about a second after you press F10.
 - Both models download once into `.cache/` next to the script. After that, no internet connection is needed.
 
-Disk use is about 1 GB in total: roughly 600 MB of Python packages, 145 MB for `base.en` (or 480 MB for `small.en`), and 120 MB for Kokoro.
+Disk use is about 1.2 GB in total: roughly 600 MB of Python packages, 145 MB for `base.en` (or 480 MB for `small.en`), and 355 MB for Kokoro.
 
 ---
 
@@ -81,7 +102,7 @@ Double-click **`run_silent.bat`**, which runs `pythonw`, so no console window ap
 The constants at the top of `dictation_app.py` control the behaviour:
 
 - `DICTATE_KEY`, `READ_KEY`, `STOP_KEY`: can be `f1`…`f24`, `pause`, `scroll_lock`, `insert`, `ctrl_r`, or `menu`.
-- `OUTPUT_MODE`: `"paste"` (fast; uses the clipboard and restores it afterwards) or `"type"` (presses each key, for apps that block pasting).
+- `DEFAULT_OUTPUT_MODE`: `"type"` or `"paste"` (also switchable in the tray menu). `PASTE_RESTORE_DELAY` sets how long paste mode waits before putting your clipboard back.
 - `MAX_RECORD_SECONDS`: a safety limit on recording length (120 s).
 - `READ_CLIPBOARD_IF_NO_SELECTION`, `MAX_READ_CHARS`, `VOICES`, `SPEEDS`.
 
@@ -119,6 +140,11 @@ hook-health thread ──── restarts the keyboard hook if it ever dies
 - **Only one copy runs at a time** (a named mutex enforces this), so text is never typed twice.
 
 ## Troubleshooting & limits on a locked-down PC
+
+- **Dictation is transcribed but the text doesn't appear:**
+  - Make sure the tray menu has **Insert dictated text by → Typing** selected.
+  - Check `dictation_app.log`. Each dictation logs a line like `Inserting 42 chars by typing into: Document1 - Word`, which shows the window the app thought had focus.
+  - If that window is right but nothing appears, the app may be running as administrator (see below).
 
 - **`pip` or model downloads fail behind a corporate proxy:**
   - Set `HTTPS_PROXY=http://proxy:port` before the first run.
