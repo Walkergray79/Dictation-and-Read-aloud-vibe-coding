@@ -34,7 +34,7 @@ del /q "settings.json" "custom_words.txt" "dictation_app.log*" 2>nul
 if exist ".cache" echo       WARNING: could not delete .cache - quit the helper from the tray and run this again.
 
 echo [3/5] Removing the start-at-login shortcut...
-powershell -NoProfile -Command "$sh = New-Object -ComObject WScript.Shell; Get-ChildItem ([Environment]::GetFolderPath('Startup')) -Filter *.lnk | Where-Object { "$($sh.CreateShortcut($_.FullName).TargetPath)".StartsWith($env:APPDIR + '\', 'OrdinalIgnoreCase') } | Remove-Item -Force"
+powershell -NoProfile -Command "$sh = New-Object -ComObject WScript.Shell; Get-ChildItem ([Environment]::GetFolderPath('Startup')) -Filter *.lnk | Where-Object { ([string]$sh.CreateShortcut($_.FullName).TargetPath).StartsWith($env:APPDIR + '\', 'OrdinalIgnoreCase') } | Remove-Item -Force"
 
 echo [4/5] Python packages
 echo       The helper installed about 600 MB of Python packages - faster-whisper, kokoro-onnx, etc.
