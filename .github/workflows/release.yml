@@ -1,0 +1,56 @@
+# Publishes a GitHub release whenever a version tag (e.g. v1.6.0) is pushed.
+# The release gets a clean ZIP with only the files a user needs, plus the
+# matching section of CHANGELOG.md as its notes.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches APP_VERSION
+        run: |
+          app=$(sed -n 's/^APP_VERSION = "\([^"]*\)".*/\1/p' dictation_app.py)
+          if [ "v$app" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match APP_VERSION $app in dictation_app.py"
+            exit 1
+          fi
+
+      - name: Check the script compiles
+        run: python3 -m py_compile dictation_app.py
+
+      - name: Build the ZIP
+        run: |
+          mkdir -p dist
+          zip -j "dist/DictationHelper-$GITHUB_REF_NAME.zip" \
+            dictation_app.py README.md CHANGELOG.md requirements.txt \
+            run_first_time.bat run_silent.bat uninstall.bat
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          python3 - <<'PY'
+          import os, re
+          version = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(rf"^## {re.escape(version)}\s*\n(.*?)(?=^## |\Z)", text, re.S | re.M)
+          notes = (m.group(1).strip() if m else "See CHANGELOG.md.") + (
+              "\n\n**Install or update:** download the ZIP below and extract it into "
+              "`C:\\Users\\<you>\\DictationHelper\\` (keep your `.cache` folder and "
+              "`custom_words.txt`), then run `run_first_time.bat`.")
+          open("notes.md", "w", encoding="utf-8").write(notes)
+          PY
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "dist/DictationHelper-$GITHUB_REF_NAME.zip" \
+            --title "Dictation Helper $GITHUB_REF_NAME" --notes-file notes.md
