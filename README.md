@@ -29,6 +29,17 @@ Right-click the tray icon to:
 
 Your choices are saved in `settings.json`.
 
+## Statistics (timings)
+
+After every dictation and every read-aloud, the console window (when started with `run_first_time.bat`) and `dictation_app.log` show a `STATS` line, like tic/toc in MATLAB:
+
+```
+STATS dictation #3 | spoke 4.2s | transcribe 1.10s (0.26x real-time, base.en) | inserted 12 words / 63 chars in 0.30s | total 1.45s from key release
+STATS read-aloud #2 | 72 words / 412 chars in 6 chunk(s) | copy 0.12s | first sound 0.90s after F10 | synth 3.10s for 24.5s of speech (0.13x real-time) | played 24.5s (finished)
+```
+
+"Real-time" compares the time taken with the length of the audio: 0.26x means 4 seconds of speech took about 1 second to process. Choose **Show statistics** in the tray menu to see totals for the session. A summary is also logged when you quit.
+
 ## Custom words (acronyms, names, jargon)
 
 Choose **Edit custom words...** from the tray menu. `custom_words.txt` opens in Notepad. Changes apply as soon as you save; you don't need to restart. There are three kinds of line:

@@ -123,6 +123,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("HF_HOME", str(CACHE_DIR / "huggingface"))
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("HF_HUB_DISABLE_UPDATE_CHECK", "1")  # never query PyPI for new versions
 
 # ---- Hotkeys -----------------------------------------------------------------
 # Single keys only (no combos) so "hold to talk" is reliable. Supported names:
@@ -752,16 +753,18 @@ class Speaker:
     def stop(self) -> None:
         self._stop.set()
 
-    def speak(self, text: str) -> None:
+    def speak(self, text: str, pressed_at=None, copy_s: float = 0.0) -> None:
+        """pressed_at: time.perf_counter() of the F10 press (for the stats line)."""
         self.stop()
         if self._thread is not None:
             self._thread.join(timeout=2)
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, args=(text, self._stop),
-                                        name="tts-playback", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="tts-playback", daemon=True,
+                                        args=(text, self._stop, pressed_at or time.perf_counter(),
+                                              copy_s))
         self._thread.start()
 
-    def _synth(self, chunks, out_q: queue.Queue, stop: threading.Event):
+    def _synth(self, chunks, out_q: queue.Queue, stop: threading.Event, timing: dict):
         try:
             voice = self.app.settings.voice
             lang = "en-gb" if voice.startswith("b") else "en-us"
@@ -769,8 +772,11 @@ class Speaker:
                 if stop.is_set():
                     break
                 with self._tts_lock:
+                    tic = time.perf_counter()
                     audio, sr = self.app.tts.create(chunk, voice=voice,
                                                     speed=float(self.app.settings.speed), lang=lang)
+                    timing["synth"] += time.perf_counter() - tic
+                    timing["speech"] += len(audio) / sr
                 while not stop.is_set():
                     try:
                         out_q.put((np.asarray(audio, dtype=np.float32), sr), timeout=0.1)
@@ -783,15 +789,20 @@ class Speaker:
         finally:
             out_q.put(None)
 
-    def _run(self, text: str, stop: threading.Event):
+    def _run(self, text: str, stop: threading.Event, pressed_at: float, copy_s: float):
         self.app.set_state("preparing")
         stream = None
         played = 0
+        chunks = []
+        timing = {"synth": 0.0, "speech": 0.0}
+        first_sound = None
+        samples_played = 0
+        out_rate = None
+        stopped = False
         try:
             chunks = split_chunks(self.app.vocab.pronounce(prepare_text(text)))
-            log.info("Reading %d characters in %d chunk(s)", len(text), len(chunks))
             q = queue.Queue(maxsize=4)
-            threading.Thread(target=self._synth, args=(chunks, q, stop),
+            threading.Thread(target=self._synth, args=(chunks, q, stop, timing),
                              name="tts-synth", daemon=True).start()
             out_rate = None
             while not stop.is_set():
@@ -813,10 +824,14 @@ class Speaker:
                     stream.start()
                 audio = resample(audio, sr, out_rate)
                 block = int(out_rate * self.BLOCK_SECONDS)
+                if first_sound is None:
+                    first_sound = time.perf_counter() - pressed_at
                 for i in range(0, audio.size, block):
                     if stop.is_set():
                         break
                     stream.write(audio[i:i + block])
+                    samples_played += min(block, audio.size - i)
+            stopped = stop.is_set()
             if stream is not None:
                 if stop.is_set():
                     stream.abort()  # drop buffered audio instantly
@@ -833,6 +848,12 @@ class Speaker:
                     stream.close()
                 except Exception:
                     pass
+            try:
+                self.app.stats.read(text, len(chunks), copy_s, first_sound, timing["synth"],
+                                    timing["speech"], samples_played / out_rate if out_rate else 0.0,
+                                    stopped)
+            except Exception:
+                log.debug("Could not record read-aloud stats", exc_info=True)
             self.app.set_state("idle")
 
 
@@ -1091,6 +1112,58 @@ class StatusBubble:
             return None
 
 
+class Stats:
+    """Tic/toc-style timings, printed to the console (and dictation_app.log)
+    after every dictation and read-aloud, plus a session summary on Quit."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.started = time.time()
+        self.dictations = self.dictated_words = 0
+        self.dictated_audio = 0.0
+        self.reads = self.read_words = 0
+        self.read_audio = 0.0
+
+    @staticmethod
+    def _words(text: str) -> int:
+        return len(text.split())
+
+    def dictation(self, spoke_s, wait_s, transcribe_s, insert_s, total_s, text, model):
+        words = self._words(text)
+        with self._lock:
+            self.dictations += 1
+            self.dictated_words += words
+            self.dictated_audio += spoke_s
+            n = self.dictations
+        rtf = transcribe_s / spoke_s if spoke_s else 0
+        queued = f" | waited {wait_s:.1f}s in queue" if wait_s >= 0.05 else ""
+        log.info("STATS dictation #%d | spoke %.1fs%s | transcribe %.2fs (%.2fx real-time, %s) | "
+                 "inserted %d words / %d chars in %.2fs | total %.2fs from key release",
+                 n, spoke_s, queued, transcribe_s, rtf, model, words, len(text), insert_s, total_s)
+
+    def read(self, text, chunks, copy_s, first_sound_s, synth_s, speech_s, played_s, stopped):
+        words = self._words(text)
+        with self._lock:
+            self.reads += 1
+            self.read_words += words
+            self.read_audio += played_s
+            n = self.reads
+        rtf = synth_s / speech_s if speech_s else 0
+        first = f"{first_sound_s:.2f}s" if first_sound_s is not None else "-"
+        log.info("STATS read-aloud #%d | %d words / %d chars in %d chunk(s) | copy %.2fs | "
+                 "first sound %s after %s | synth %.2fs for %.1fs of speech (%.2fx real-time) | "
+                 "played %.1fs (%s)", n, words, len(text), chunks, copy_s, first, READ_KEY.upper(),
+                 synth_s, speech_s, rtf, played_s, "stopped early" if stopped else "finished")
+
+    def summary(self) -> str:
+        up = int(time.time() - self.started)
+        with self._lock:
+            return (f"STATS session | running {up // 3600}h {up % 3600 // 60:02d}m | "
+                    f"{self.dictations} dictations, {self.dictated_words} words, "
+                    f"{self.dictated_audio:.0f}s spoken | {self.reads} reads, "
+                    f"{self.read_words} words, {self.read_audio:.0f}s listened")
+
+
 def pin_tray_icon() -> str:
     """Windows 11: mark our tray icon "always show" so it sits on the taskbar
     instead of in the ^ overflow. Per-user registry setting, no admin needed.
@@ -1196,6 +1269,7 @@ class App:
         self.recorder = Recorder()
         self.speaker = Speaker(self)
         self.vocab = Vocabulary(VOCAB_FILE)
+        self.stats = Stats()
         self.bubble = StatusBubble()
         self.bubble.enabled = bool(self.settings.show_bubble)
         self._detail = None
@@ -1296,6 +1370,7 @@ class App:
                 ("Typing (works in most apps)", "type"),
                 ("Pasting (faster for long text)", "paste")]))),
             Item("Edit custom words...", lambda icon, item: self._edit_vocab()),
+            Item("Show statistics", lambda icon, item: self._show_stats()),
             Item("Pin icon to taskbar", lambda icon, item: threading.Thread(
                 target=self._pin_icon, args=(True,), name="tray-pin", daemon=True).start()),
             Item("Show status bubble", lambda icon, item: self._set_setting(
@@ -1370,6 +1445,11 @@ class App:
             log.info("Tray icon pinning result: %s", result)
             self.flash("Couldn't pin automatically - drag the icon from ^", "warn")
 
+    def _show_stats(self):
+        summary = self.stats.summary()
+        log.info(summary)
+        self.notify(summary.replace("STATS session | ", "").replace(" | ", "\n"))
+
     def _edit_vocab(self):
         try:
             self.vocab.open_in_editor()
@@ -1391,13 +1471,16 @@ class App:
     # ---- startup -------------------------------------------------------------
     def _load_models(self):
         try:
+            tic = time.perf_counter()
             self.stt = load_whisper(self.settings.whisper_model)
-            log.info("Whisper '%s' ready", self.settings.whisper_model)
+            stt_s = time.perf_counter() - tic
+            tic = time.perf_counter()
             self.tts = load_kokoro()
             if self.settings.voice not in self.tts.get_voices():
                 self.settings.voice = DEFAULT_VOICE
             self.tts.create("Ready.", voice=self.settings.voice, speed=1.0, lang="en-us")  # warm-up
-            log.info("Kokoro TTS ready")
+            log.info("STATS startup | dictation model %s loaded in %.1fs | read-aloud voice loaded "
+                     "in %.1fs", self.settings.whisper_model, stt_s, time.perf_counter() - tic)
             self.set_state("idle")
             chime("success")
             self.flash(f"Ready - hold {DICTATE_KEY.upper()} to dictate, {READ_KEY.upper()} to read")
@@ -1452,6 +1535,7 @@ class App:
 
     def quit(self):
         self._running = False
+        log.info(self.stats.summary())
         try:
             self.speaker.stop()
             if self.recorder.active:
@@ -1537,7 +1621,7 @@ class App:
         with self._pending_lock:
             self._pending_transcriptions += 1
         self.set_state("transcribing")
-        self.transcribe_q.put(audio)
+        self.transcribe_q.put((audio, time.perf_counter()))  # tic: key released
 
     def _on_dictate_timeout(self):
         if self.recorder.active and time.time() - self._record_started >= MAX_RECORD_SECONDS - 1:
@@ -1557,11 +1641,13 @@ class App:
             return
         if self.recorder.active:
             return
+        pressed_at = time.perf_counter()  # tic: F10 pressed
         chime("read")                # instant "I heard you"...
         self.set_state("preparing")  # ...and the bubble appears before any slow work
-        threading.Thread(target=self._read_selection, name="reader", daemon=True).start()
+        threading.Thread(target=self._read_selection, args=(pressed_at,), name="reader",
+                         daemon=True).start()
 
-    def _read_selection(self):
+    def _read_selection(self, pressed_at: float):
         try:
             text = copy_selection()
         except Exception:
@@ -1576,7 +1662,7 @@ class App:
         if len(text) > MAX_READ_CHARS:
             self.notify(f"Long selection - reading the first {MAX_READ_CHARS:,} characters.")
             text = text[:MAX_READ_CHARS]
-        self.speaker.speak(text)
+        self.speaker.speak(text, pressed_at, time.perf_counter() - pressed_at)
 
     def _cancel_recording(self):
         if self.recorder.active:
@@ -1594,15 +1680,22 @@ class App:
     def _transcribe_loop(self):
         """Runs Whisper off the hook/tray threads; one recording at a time, in order."""
         while self._running:
-            audio = self.transcribe_q.get()
-            if audio is None:
+            job = self.transcribe_q.get()
+            if job is None:
                 break
+            audio, released_at = job
             try:
+                started = time.perf_counter()
                 text = self._transcribe(audio)
+                transcribed = time.perf_counter()
                 if text:
                     output_text(text + " ", self.settings.output_mode)
                     chime("success")
                     self.flash("Done")
+                    done = time.perf_counter()
+                    self.stats.dictation(audio.size / SAMPLE_RATE, started - released_at,
+                                         transcribed - started, done - transcribed,
+                                         done - released_at, text, self.settings.whisper_model)
                 elif text is None:
                     chime("error")
                     self.flash("No sound from mic - check the tray menu", "error")
@@ -1624,7 +1717,6 @@ class App:
         if float(np.max(np.abs(audio))) < 0.002:
             log.info("Recording is silent - is the right microphone selected / unmuted?")
             return None
-        start = time.time()
         model_name = self.settings.whisper_model
         segments, _info = self.stt.transcribe(
             audio,
@@ -1638,8 +1730,7 @@ class App:
         )
         text = " ".join(seg.text.strip() for seg in segments).strip()
         text = self.vocab.fix(re.sub(r"\s+", " ", text))
-        log.info("Transcribed %.1fs of audio in %.1fs: %r",
-                 audio.size / SAMPLE_RATE, time.time() - start, text)
+        log.info("Heard: %r", text)
         return text
 
 
