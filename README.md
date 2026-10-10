@@ -40,6 +40,16 @@ STATS read-aloud #2 | 72 words / 412 chars in 6 chunk(s) | copy 0.12s | first so
 
 "Real-time" compares the time taken with the length of the audio: 0.26x means 4 seconds of speech took about 1 second to process. Choose **Show statistics** in the tray menu to see totals for the session. A summary is also logged when you quit.
 
+## Version & updates
+
+- **Which version am I running?**
+  - Hover over the tray icon, or choose **About** in its menu.
+  - About also copies the version, model and Python details to the clipboard, so colleagues can paste them into an email or chat.
+  - What changed in each version is listed in `CHANGELOG.md`.
+- **Model updates:** the app never goes online by itself.
+  - **Updates → Check for model updates now** checks Hugging Face (dictation model), GitHub (voice model) and PyPI (speech engines). It reports what it finds and asks before downloading anything.
+  - **Updates → Check automatically at startup** does the same check quietly each time the app starts, and only pops up a message if something new is available. It's off by default.
+
 ## Custom words (acronyms, names, jargon)
 
 Choose **Edit custom words...** from the tray menu. `custom_words.txt` opens in Notepad. Changes apply as soon as you save; you don't need to restart. There are three kinds of line:

@@ -112,6 +112,7 @@ import wave
 from pathlib import Path
 
 APP_NAME = "Dictation & Read-Aloud Helper"
+APP_VERSION = "1.6.0"  # bump on every release; see CHANGELOG.md
 APP_DIR = Path(__file__).resolve().parent
 CACHE_DIR = APP_DIR / ".cache"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -151,6 +152,7 @@ KOKORO_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/mode
 KOKORO_MODEL = "kokoro-v1.0.onnx"
 KOKORO_MODEL_FALLBACK = "kokoro-v1.0.int8.onnx"
 KOKORO_VOICES = "voices-v1.0.bin"
+KOKORO_MODEL_RELEASE = "1.0"  # matches "model-files-v1.0" in KOKORO_URL
 VOICES = {
     "Heart (US, female)": "af_heart",
     "Bella (US, female)": "af_bella",
@@ -221,6 +223,7 @@ class Settings:
         self.output_mode = DEFAULT_OUTPUT_MODE
         self.show_bubble = True
         self.auto_pin_done = False  # tray icon auto-pinned once (Windows 11)
+        self.check_updates_on_start = False  # off: the app stays fully offline
         try:
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
             for key in self.__dict__:
@@ -586,6 +589,144 @@ def load_kokoro():
                         KOKORO_MODEL, exc, KOKORO_MODEL_FALLBACK)
             model = fallback
     return Kokoro(str(model), str(voices))
+
+
+# =============================================================================
+# 5b. VERSION INFO & MODEL UPDATE CHECKS (only ever run when you ask)
+# =============================================================================
+def _pkg_version(name: str) -> str:
+    try:
+        from importlib.metadata import version
+        return version(name)
+    except Exception:
+        return "?"
+
+
+def whisper_local_revision(model_name: str):
+    """Commit id of the downloaded Whisper model (recorded by huggingface_hub)."""
+    meta = CACHE_DIR / "whisper" / model_name / ".cache" / "huggingface" / "download" / "model.bin.metadata"
+    try:
+        return meta.read_text(encoding="utf-8").splitlines()[0].strip() or None
+    except (OSError, IndexError):
+        return None
+
+
+def version_report(app) -> str:
+    """Plain-text summary for the About box - easy for colleagues to copy and send."""
+    rev = whisper_local_revision(app.settings.whisper_model)
+    voice_file = KOKORO_MODEL if (CACHE_DIR / "kokoro" / KOKORO_MODEL).exists() else KOKORO_MODEL_FALLBACK
+    return "\n".join([
+        f"{APP_NAME}",
+        f"Version {APP_VERSION}",
+        "",
+        f"Dictation model: {app.settings.whisper_model} (revision {rev[:7] if rev else 'unknown'})",
+        f"Read-aloud voice: {voice_file}, voice {app.settings.voice}, speed {app.settings.speed:g}x",
+        f"Insert mode: {app.settings.output_mode}",
+        "",
+        f"Python {sys.version.split()[0]} ({sys.executable})",
+        f"faster-whisper {_pkg_version('faster-whisper')}, ctranslate2 {_pkg_version('ctranslate2')}, "
+        f"kokoro-onnx {_pkg_version('kokoro-onnx')}, onnxruntime {_pkg_version('onnxruntime')}",
+        f"Folder: {APP_DIR}",
+    ])
+
+
+def _get_json(url: str, timeout: float = 15):
+    req = urllib.request.Request(url, headers={"User-Agent": f"DictationHelper/{APP_VERSION}",
+                                               "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _version_tuple(v: str):
+    return tuple(int(x) for x in re.findall(r"\d+", v))
+
+
+def check_model_updates(whisper_model: str) -> dict:
+    """Ask Hugging Face / GitHub / PyPI whether anything newer exists.
+    Downloads nothing. Each check is independent, so one blocked site
+    (common on work networks) doesn't spoil the others."""
+    result = {"lines": [], "whisper_update": False, "anything_new": False}
+    lines = result["lines"]
+
+    # 1) Dictation model: compare the downloaded revision with the latest on Hugging Face
+    try:
+        from faster_whisper.utils import _MODELS
+        from huggingface_hub import HfApi
+        latest = HfApi().model_info(_MODELS[whisper_model], timeout=15).sha
+        local = whisper_local_revision(whisper_model)
+        if local and latest and local != latest:
+            result["whisper_update"] = result["anything_new"] = True
+            lines.append(f"Dictation model {whisper_model}: UPDATE AVAILABLE "
+                         f"({local[:7]} -> {latest[:7]})")
+        elif local:
+            lines.append(f"Dictation model {whisper_model}: up to date ({local[:7]})")
+        else:
+            lines.append(f"Dictation model {whisper_model}: latest is {latest[:7]} "
+                         "(installed revision unknown)")
+    except Exception as exc:
+        lines.append(f"Dictation model: could not check ({type(exc).__name__})")
+
+    # 2) Read-aloud voice: newer "model-files-vX.Y" releases on GitHub
+    try:
+        releases = _get_json("https://api.github.com/repos/thewh1teagle/kokoro-onnx/releases?per_page=50")
+        tags = [r.get("tag_name", "") for r in releases]
+        versions = sorted((_version_tuple(t), t) for t in tags if t.startswith("model-files-v"))
+        if versions and versions[-1][0] > _version_tuple(KOKORO_MODEL_RELEASE):
+            result["anything_new"] = True
+            lines.append(f"Read-aloud voice: newer release {versions[-1][1]} exists "
+                         f"(you have v{KOKORO_MODEL_RELEASE}; needs a future app version)")
+        else:
+            lines.append(f"Read-aloud voice: up to date (v{KOKORO_MODEL_RELEASE})")
+    except Exception as exc:
+        lines.append(f"Read-aloud voice: could not check ({type(exc).__name__})")
+
+    # 3) Speech engines (Python packages) - for information only
+    for pkg in ("faster-whisper", "kokoro-onnx"):
+        try:
+            latest = _get_json(f"https://pypi.org/pypi/{pkg}/json")["info"]["version"]
+            installed = _pkg_version(pkg)
+            if installed != "?" and _version_tuple(latest) > _version_tuple(installed):
+                result["anything_new"] = True
+                lines.append(f"{pkg}: {installed} installed, {latest} available")
+            else:
+                lines.append(f"{pkg}: up to date ({installed})")
+        except Exception as exc:
+            lines.append(f"{pkg}: could not check ({type(exc).__name__})")
+    return result
+
+
+def update_whisper_model(model_name: str) -> None:
+    """Download the latest revision into a side folder, then swap it in, so a
+    failed or interrupted download never breaks the working model."""
+    from faster_whisper.utils import download_model
+    import shutil
+
+    final = CACHE_DIR / "whisper" / model_name
+    fresh = CACHE_DIR / "whisper" / (model_name + ".new")
+    old = CACHE_DIR / "whisper" / (model_name + ".old")
+    for d in (fresh, old):
+        shutil.rmtree(d, ignore_errors=True)
+    download_model(model_name, output_dir=str(fresh))
+    if final.exists():
+        final.rename(old)
+    try:
+        fresh.rename(final)
+    except OSError:
+        if old.exists():
+            old.rename(final)  # put the working model back
+        raise
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def message_box(text: str, yes_no: bool = False) -> bool:
+    """Windows message box (returns True for Yes). Falls back to the log elsewhere."""
+    if not IS_WINDOWS:
+        log.info("%s", text)
+        return False
+    MB_YESNO, MB_ICONQUESTION, MB_ICONINFO = 0x4, 0x20, 0x40
+    MB_SETFOREGROUND, MB_TOPMOST = 0x10000, 0x40000
+    flags = MB_SETFOREGROUND | MB_TOPMOST | ((MB_YESNO | MB_ICONQUESTION) if yes_no else MB_ICONINFO)
+    return ctypes.windll.user32.MessageBoxW(None, text, f"{APP_NAME} v{APP_VERSION}", flags) == 6
 
 
 # =============================================================================
@@ -1282,7 +1423,8 @@ class App:
         self._pending_lock = threading.Lock()
         self._running = True
         self.icon = pystray.Icon("dictation_helper", make_icon(STATE_COLORS["loading"]),
-                                 f"{APP_NAME}\n{STATE_LABELS['loading']}", self._build_menu())
+                                 f"{APP_NAME} v{APP_VERSION}\n{STATE_LABELS['loading']}",
+                                 self._build_menu())
 
     # ---- state / tray -----------------------------------------------------
     def is_busy(self) -> bool:
@@ -1314,7 +1456,7 @@ class App:
             try:
                 self.icon.icon = make_icon(STATE_COLORS.get(state, STATE_COLORS["idle"]),
                                            paused=(state == "paused"))
-                self.icon.title = f"{APP_NAME}\n{STATE_LABELS.get(state, state)}"[:127]
+                self.icon.title = f"{APP_NAME} v{APP_VERSION}\n{STATE_LABELS.get(state, state)}"[:127]
                 self.icon.update_menu()
             except Exception:
                 pass
@@ -1371,6 +1513,15 @@ class App:
                 ("Pasting (faster for long text)", "paste")]))),
             Item("Edit custom words...", lambda icon, item: self._edit_vocab()),
             Item("Show statistics", lambda icon, item: self._show_stats()),
+            Item("Updates", Menu(
+                Item("Check for model updates now", lambda icon, item: threading.Thread(
+                    target=self._check_updates, args=(True,), name="update-check",
+                    daemon=True).start()),
+                Item("Check automatically at startup", lambda icon, item: self._set_setting(
+                    "check_updates_on_start", not self.settings.check_updates_on_start),
+                     checked=lambda item: bool(self.settings.check_updates_on_start)))),
+            Item(f"About (version {APP_VERSION})", lambda icon, item: threading.Thread(
+                target=self._show_about, name="about", daemon=True).start()),
             Item("Pin icon to taskbar", lambda icon, item: threading.Thread(
                 target=self._pin_icon, args=(True,), name="tray-pin", daemon=True).start()),
             Item("Show status bubble", lambda icon, item: self._set_setting(
@@ -1445,6 +1596,60 @@ class App:
             log.info("Tray icon pinning result: %s", result)
             self.flash("Couldn't pin automatically - drag the icon from ^", "warn")
 
+    def _show_about(self):
+        report = version_report(self)
+        log.info("About:\n%s", report)
+        copied = clip_set(report)
+        message_box(report + ("\n\n(Copied to the clipboard - paste it into an email or chat.)"
+                              if copied else ""))
+
+    def _check_updates(self, interactive: bool):
+        """interactive=True: from the menu (shows results, offers to install).
+        False: the optional startup check (only speaks up if something is new)."""
+        if interactive:
+            self.bubble.show("Checking for model updates...", STATE_COLORS["transcribing"])
+        log.info("Checking for model updates (%s)", "requested" if interactive else "at startup")
+        result = check_model_updates(self.settings.whisper_model)
+        for line in result["lines"]:
+            log.info("UPDATE CHECK | %s", line)
+        if interactive:
+            self._restore_bubble()
+        if not interactive:
+            if result["anything_new"]:
+                self.notify("Model updates are available - see Updates in the tray menu.")
+            return
+        summary = "\n".join(result["lines"])
+        if result["whisper_update"]:
+            if message_box(summary + "\n\nDownload the dictation model update now? "
+                           "(needs internet; the current model keeps working until it finishes)",
+                           yes_no=True):
+                self._install_whisper_update()
+        else:
+            message_box(summary + ("" if result["anything_new"] else "\n\nEverything is up to date."))
+
+    def _restore_bubble(self):
+        """Put the bubble back to whatever the app is doing right now."""
+        text = BUBBLE_TEXT.get(self.state)
+        if text:
+            self.bubble.show(text, STATE_COLORS[self.state])
+        else:
+            self.bubble.hide()
+
+    def _install_whisper_update(self):
+        name = self.settings.whisper_model
+        try:
+            self.bubble.show("Downloading model update...", STATE_COLORS["loading"])
+            update_whisper_model(name)
+            self.stt = load_whisper(name)
+            log.info("Dictation model %s updated to %s", name, whisper_local_revision(name))
+            self._restore_bubble()
+            self.flash("Model updated")
+        except Exception as exc:
+            log.exception("Model update failed")
+            self._restore_bubble()
+            self.flash("Model update failed - see the log", "error")
+            self.notify(f"Model update failed: {exc}. The previous model is still in use.")
+
     def _show_stats(self):
         summary = self.stats.summary()
         log.info(summary)
@@ -1484,6 +1689,9 @@ class App:
             self.set_state("idle")
             chime("success")
             self.flash(f"Ready - hold {DICTATE_KEY.upper()} to dictate, {READ_KEY.upper()} to read")
+            if self.settings.check_updates_on_start:
+                threading.Thread(target=self._check_updates, args=(False,), name="update-check",
+                                 daemon=True).start()
             self.notify(f"Ready! Hold {DICTATE_KEY.upper()} to dictate, "
                         f"press {READ_KEY.upper()} to read highlighted text.")
         except Exception as exc:
@@ -1529,7 +1737,7 @@ class App:
         self.hotkeys.start()
 
     def run(self):
-        log.info("%s starting (Python %s)", APP_NAME, sys.version.split()[0])
+        log.info("%s v%s starting (Python %s)", APP_NAME, APP_VERSION, sys.version.split()[0])
         self.icon.run(setup=self._setup)  # blocks: tray message loop on main thread
         log.info("Exited")
 
