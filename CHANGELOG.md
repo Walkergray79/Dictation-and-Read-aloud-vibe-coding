@@ -2,6 +2,16 @@
 
 The version number is shown in the tray icon's tooltip and in **About** in the tray menu. About also copies the details to the clipboard, ready to paste into an email or chat.
 
+## 1.9.0
+- New **Options** window (right-click menu → **Options...**) for the set-and-forget settings, so the right-click menu only has everyday items.
+  - **General:** status bubble, Typing/Pasting, dictation model.
+  - **Keys:** change hotkeys.
+  - **Tools:** live statistics, model updates, open app folder, custom words, pin icon.
+  - **About:** version info and a copy button.
+- Changes in Options apply immediately, with no OK/Apply button.
+- If tkinter is missing, those settings appear under **More** in the right-click menu instead.
+- Quitting now always closes the app straight away.
+
 ## 1.8.0
 - **Open app folder** in the tray menu opens this copy's installation folder in File Explorer. That's where you'll find `custom_words.txt`, `settings.json`, the log and `uninstall.bat`.
 

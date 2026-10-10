@@ -113,7 +113,7 @@ import wave
 from pathlib import Path
 
 APP_NAME = "Dictation & Read-Aloud Helper"
-APP_VERSION = "1.8.0"  # bump on every release; see CHANGELOG.md
+APP_VERSION = "1.9.0"  # bump on every release; see CHANGELOG.md
 APP_DIR = Path(__file__).resolve().parent
 CACHE_DIR = APP_DIR / ".cache"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -1185,6 +1185,7 @@ class StatusBubble:
     def __init__(self):
         self._q = queue.Queue()
         self.enabled = True
+        self.ok = False  # True once Tk is up (the Options window needs it too)
         threading.Thread(target=self._run, name="status-bubble", daemon=True).start()
 
     # ---- thread-safe API ----------------------------------------------------
@@ -1196,6 +1197,10 @@ class StatusBubble:
 
     def hide(self):
         self._q.put(("hide",))
+
+    def call(self, fn):
+        """Run fn(root) on the Tk thread - used to open the Options window."""
+        self._q.put(("call", fn))
 
     # ---- Tk thread ------------------------------------------------------------
     def _run(self):
@@ -1235,6 +1240,7 @@ class StatusBubble:
         except Exception:
             log.exception("Could not create status bubble")
             return
+        self.ok = True
 
         state = {"text": "", "color": (128, 128, 128), "animate": False,
                  "tick": 0, "hide_at": None, "visible": False}
@@ -1259,6 +1265,12 @@ class StatusBubble:
             try:
                 while True:
                     msg = self._q.get_nowait()
+                    if msg[0] == "call":
+                        try:
+                            msg[1](root)
+                        except Exception:
+                            log.exception("Window error")
+                        continue
                     if msg[0] == "hide" or not self.enabled:
                         if msg[0] == "hide" and state["hide_at"] and self.enabled:
                             continue  # let a "Done"/"Nothing selected" flash finish
@@ -1310,6 +1322,181 @@ class StatusBubble:
         except Exception:
             log.exception("Could not style status bubble")
             return None
+
+
+class OptionsWindow:
+    """The Options window: everything you set once and rarely touch again,
+    kept out of the right-click menu. Runs on the Tk thread (see StatusBubble.call).
+    Every change applies immediately - there is no OK/Apply button to forget."""
+
+    FONT = ("Segoe UI", 11)
+
+    def __init__(self, root, app):
+        import tkinter as tk
+        from tkinter import ttk
+        self.tk, self.ttk, self.app = tk, ttk, app
+        self.win = win = tk.Toplevel(root)
+        win.title(f"{APP_NAME} - Options")
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self.close)
+        style = ttk.Style(win)
+        for widget in (".", "TButton", "TCheckbutton", "TRadiobutton", "TLabel", "TLabelframe.Label"):
+            style.configure(widget, font=self.FONT)
+
+        tabs = ttk.Notebook(win)
+        tabs.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+        self._general_tab(tabs)
+        self._keys_tab(tabs)
+        self._tools_tab(tabs)
+        self._about_tab(tabs)
+        ttk.Button(win, text="Close", command=self.close).pack(anchor="e", padx=10, pady=10)
+        self.tabs = tabs
+
+        if IS_WINDOWS:  # give it its own taskbar button so it can't get lost behind windows
+            try:
+                win.update_idletasks()
+                hwnd = ctypes.windll.user32.GetParent(win.winfo_id()) or win.winfo_id()
+                ex = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+                ctypes.windll.user32.SetWindowLongW(hwnd, -20, ex | 0x00040000)  # WS_EX_APPWINDOW
+            except Exception:
+                pass
+        self._sync()
+        self.show()
+
+    # ---- tabs -----------------------------------------------------------------
+    def _general_tab(self, tabs):
+        tk, ttk, app = self.tk, self.ttk, self.app
+        f = ttk.Frame(tabs, padding=14)
+        tabs.add(f, text="General")
+        self.v_bubble = tk.BooleanVar()
+        ttk.Checkbutton(f, text="Show the status bubble (Listening..., Reading aloud...)",
+                        variable=self.v_bubble,
+                        command=lambda: app._set_setting("show_bubble", self.v_bubble.get())
+                        ).pack(anchor="w", pady=3)
+
+        box = ttk.LabelFrame(f, text="Insert dictated text by", padding=8)
+        box.pack(fill="x", pady=8)
+        self.v_output = tk.StringVar()
+        for label, value in (("Typing (works in most apps)", "type"),
+                             ("Pasting (faster for long text)", "paste")):
+            ttk.Radiobutton(box, text=label, value=value, variable=self.v_output,
+                            command=lambda: app._set_setting("output_mode", self.v_output.get())
+                            ).pack(anchor="w")
+
+        box = ttk.LabelFrame(f, text="Dictation model", padding=8)
+        box.pack(fill="x", pady=8)
+        self.v_model = tk.StringVar()
+        for label, value in WHISPER_MODELS.items():
+            hint = "  - quicker" if value == "base.en" else "  - more accurate, better in noise"
+            ttk.Radiobutton(box, text=label + hint, value=value, variable=self.v_model,
+                            command=lambda: app._set_setting("whisper_model", self.v_model.get())
+                            ).pack(anchor="w")
+
+    def _keys_tab(self, tabs):
+        tk, ttk, app = self.tk, self.ttk, self.app
+        f = ttk.Frame(tabs, padding=14)
+        tabs.add(f, text="Keys")
+        self.key_boxes = {}
+        for row, role in enumerate(("dictate", "read", "stop")):
+            names = [n for n in HOTKEY_CHOICES if key_allowed(role, n)]
+            ttk.Label(f, text=ROLE_NAMES[role]).grid(row=row, column=0, sticky="w", pady=6)
+            box = ttk.Combobox(f, state="readonly", width=14, font=self.FONT,
+                               values=[HOTKEY_CHOICES[n][1] for n in names])
+            box.grid(row=row, column=1, padx=10)
+            box.bind("<<ComboboxSelected>>", lambda e, r=role, b=box, ns=names:
+                     app._assign_key(r, ns[b.current()]))
+            ttk.Button(f, text="Press a key...",
+                       command=lambda r=role: app._start_key_capture(r)).grid(row=row, column=2)
+            self.key_boxes[role] = box
+        ttk.Button(f, text="Reset to " + " / ".join(HOTKEY_CHOICES[DEFAULT_KEYS[r]][1] for r in
+                                                    ("dictate", "read", "stop")),
+                   command=app._reset_keys).grid(row=3, column=0, columnspan=3, sticky="w", pady=(14, 4))
+        ttk.Label(f, wraplength=430, justify="left", text=(
+            "Allowed: F1-F24, Pause, Scroll Lock, Insert, Print Screen, Right Ctrl, Menu key. "
+            "Esc can only be the stop key. Picking a key that's already used swaps the two. "
+            "On laptops where F keys change brightness/volume, Right Ctrl or Pause can be easier."
+        )).grid(row=4, column=0, columnspan=3, sticky="w")
+
+    def _tools_tab(self, tabs):
+        tk, ttk, app = self.tk, self.ttk, self.app
+        f = ttk.Frame(tabs, padding=14)
+        tabs.add(f, text="Tools")
+
+        box = ttk.LabelFrame(f, text="Statistics (this session)", padding=8)
+        box.pack(fill="x")
+        self.v_stats = tk.StringVar()
+        ttk.Label(box, textvariable=self.v_stats, justify="left").pack(anchor="w")
+
+        box = ttk.LabelFrame(f, text="Updates", padding=8)
+        box.pack(fill="x", pady=8)
+        ttk.Button(box, text="Check for model updates now", command=lambda: threading.Thread(
+            target=app._check_updates, args=(True,), name="update-check", daemon=True).start()
+                   ).pack(anchor="w")
+        self.v_autoupdate = tk.BooleanVar()
+        ttk.Checkbutton(box, text="Check automatically at startup (otherwise fully offline)",
+                        variable=self.v_autoupdate,
+                        command=lambda: app._set_setting("check_updates_on_start",
+                                                         self.v_autoupdate.get())
+                        ).pack(anchor="w", pady=(6, 0))
+
+        box = ttk.LabelFrame(f, text="Files and taskbar", padding=8)
+        box.pack(fill="x")
+        row = ttk.Frame(box)
+        row.pack(anchor="w")
+        ttk.Button(row, text="Open app folder", command=app._open_app_folder).pack(side="left")
+        ttk.Button(row, text="Edit custom words", command=app._edit_vocab).pack(side="left", padx=8)
+        ttk.Button(row, text="Pin icon to taskbar", command=lambda: threading.Thread(
+            target=app._pin_icon, args=(True,), name="tray-pin", daemon=True).start()
+                   ).pack(side="left")
+
+    def _about_tab(self, tabs):
+        tk, ttk = self.tk, self.ttk
+        f = ttk.Frame(tabs, padding=14)
+        tabs.add(f, text="About")
+        self.about = tk.Text(f, width=62, height=12, wrap="word", font=self.FONT,
+                             relief="flat", background=f.winfo_toplevel().cget("background"))
+        self.about.pack(fill="both")
+        ttk.Button(f, text="Copy to clipboard (for sending to support)",
+                   command=self._copy_about).pack(anchor="w", pady=(8, 0))
+
+    # ---- behaviour ----------------------------------------------------------------
+    def _copy_about(self):
+        text = version_report(self.app)
+        threading.Thread(target=lambda: (clip_set(text), self.app.flash("Copied version info")),
+                         daemon=True).start()
+
+    def _sync(self):
+        """Keep the widgets in step with the settings (they can change elsewhere,
+        e.g. a key chosen by pressing it, or the tray menu)."""
+        if not self.win.winfo_exists():
+            return
+        st = self.app.settings
+        self.v_bubble.set(bool(st.show_bubble))
+        self.v_output.set(st.output_mode)
+        self.v_model.set(st.whisper_model)
+        self.v_autoupdate.set(bool(st.check_updates_on_start))
+        for role, box in self.key_boxes.items():
+            box.set(HOTKEY_CHOICES[KEYS[role]][1])
+        self.v_stats.set(self.app.stats.summary().replace("STATS session | ", "")
+                         .replace(" | ", "\n"))
+        about = version_report(self.app)
+        if self.about.get("1.0", "end-1c") != about:
+            self.about.configure(state="normal")
+            self.about.delete("1.0", "end")
+            self.about.insert("1.0", about)
+            self.about.configure(state="disabled")
+        self.win.after(700, self._sync)
+
+    def show(self):
+        self.win.deiconify()
+        self.win.lift()
+        self.win.attributes("-topmost", True)   # pop in front of other windows...
+        self.win.after(300, lambda: self.win.attributes("-topmost", False))  # ...then behave normally
+        self.win.focus_force()
+
+    def close(self):
+        self.app._options = None
+        self.win.destroy()
 
 
 class Stats:
@@ -1473,6 +1660,7 @@ class App:
         self.stats = Stats()
         self.bubble = StatusBubble()
         self.bubble.enabled = bool(self.settings.show_bubble)
+        self._options = None  # the Options window, while open
         self._detail = None
         self.paused = False
         self._load_failed = False
@@ -1558,6 +1746,7 @@ class App:
 
             return [Item(label, pick(v), checked=is_on(v), radio=True) for label, v in options]
 
+        # Everyday items only; set-and-forget settings live in the Options window.
         return Menu(
             # default=True -> a left-click on the tray icon toggles pause
             Item(lambda item: "Turn back on" if self.paused else "Pause (F9/F10 work as normal keys)",
@@ -1568,33 +1757,52 @@ class App:
             Item("Reading voice", Menu(lambda: choice_items("voice", VOICES.items()))),
             Item("Reading speed", Menu(lambda: choice_items(
                 "speed", [(f"{s:g}x", s) for s in SPEEDS]))),
+            Item("Stop reading", lambda icon, item: self.speaker.stop(),
+                 enabled=lambda item: self.speaker.busy),
+            Menu.SEPARATOR,
+            Item("Edit custom words...", lambda icon, item: self._edit_vocab()),
+            Item("Options...", lambda icon, item: self._open_options()),
+            # Fallback when tkinter is missing (e.g. the embeddable Python): no Options
+            # window is possible, so the same settings appear here instead.
+            Item("More", Menu(lambda: self._fallback_items(choice_items)),
+                 visible=lambda item: not self.bubble.ok),
+            Menu.SEPARATOR,
+            Item("Quit", lambda icon, item: self.quit()),
+        )
+
+    def _fallback_items(self, choice_items):
+        Item, Menu = pystray.MenuItem, pystray.Menu
+        return [
             Item("Dictation model", Menu(lambda: choice_items("whisper_model", WHISPER_MODELS.items()))),
             Item("Keys", Menu(lambda: self._key_menu_items())),
             Item("Insert dictated text by", Menu(lambda: choice_items("output_mode", [
                 ("Typing (works in most apps)", "type"),
                 ("Pasting (faster for long text)", "paste")]))),
-            Item("Edit custom words...", lambda icon, item: self._edit_vocab()),
             Item("Show statistics", lambda icon, item: self._show_stats()),
-            Item("Updates", Menu(
-                Item("Check for model updates now", lambda icon, item: threading.Thread(
-                    target=self._check_updates, args=(True,), name="update-check",
-                    daemon=True).start()),
-                Item("Check automatically at startup", lambda icon, item: self._set_setting(
-                    "check_updates_on_start", not self.settings.check_updates_on_start),
-                     checked=lambda item: bool(self.settings.check_updates_on_start)))),
+            Item("Check for model updates now", lambda icon, item: threading.Thread(
+                target=self._check_updates, args=(True,), name="update-check", daemon=True).start()),
+            Item("Check for updates at startup", lambda icon, item: self._set_setting(
+                "check_updates_on_start", not self.settings.check_updates_on_start),
+                 checked=lambda item: bool(self.settings.check_updates_on_start)),
             Item("Open app folder", lambda icon, item: self._open_app_folder()),
-            Item(f"About (version {APP_VERSION})", lambda icon, item: threading.Thread(
-                target=self._show_about, name="about", daemon=True).start()),
             Item("Pin icon to taskbar", lambda icon, item: threading.Thread(
                 target=self._pin_icon, args=(True,), name="tray-pin", daemon=True).start()),
-            Item("Show status bubble", lambda icon, item: self._set_setting(
-                "show_bubble", not self.settings.show_bubble),
-                 checked=lambda item: bool(self.settings.show_bubble)),
-            Menu.SEPARATOR,
-            Item("Stop reading", lambda icon, item: self.speaker.stop(),
-                 enabled=lambda item: self.speaker.busy),
-            Item("Quit", lambda icon, item: self.quit()),
-        )
+            Item(f"About (version {APP_VERSION})", lambda icon, item: threading.Thread(
+                target=self._show_about, name="about", daemon=True).start()),
+        ]
+
+    def _open_options(self):
+        if not self.bubble.ok:
+            self.notify("The Options window needs tkinter (included with the python.org "
+                        "installer). Use the 'More' menu instead.")
+            return
+
+        def open_on_tk_thread(root):
+            if self._options is not None and self._options.win.winfo_exists():
+                self._options.show()  # already open: bring it to the front
+            else:
+                self._options = OptionsWindow(root, self)
+        self.bubble.call(open_on_tk_thread)
 
     def _set_setting(self, key, value):
         old = getattr(self.settings, key)
@@ -1933,6 +2141,8 @@ class App:
         log.info("%s v%s starting (Python %s)", APP_NAME, APP_VERSION, sys.version.split()[0])
         self.icon.run(setup=self._setup)  # blocks: tray message loop on main thread
         log.info("Exited")
+        logging.shutdown()
+        os._exit(0)  # don't wait for the Tk/audio threads to wind down on their own
 
     def quit(self):
         self._running = False

@@ -20,13 +20,24 @@ An offline dictation (speech-to-text) and read-aloud (text-to-speech) tool for W
 - On **Windows 11**, the helper pins its tray icon to the taskbar automatically the first time it runs, so it isn't hidden under the **^** arrow. If the icon disappears after a Python update, choose **Pin icon to taskbar** from its menu.
 - On **Windows 10**, drag the icon from the **^** pop-up onto the taskbar once.
 
-Right-click the tray icon to:
-- choose the **microphone**, **reading voice**, **reading speed** and **dictation model** (Fast `base.en` / Accurate `small.en`);
-- choose how dictated text is inserted: **Typing** (default; works in most apps) or **Pasting** (faster for long text);
-- **Edit custom words**;
-- **Open app folder**: opens the installation folder in File Explorer (custom words, settings, log, uninstaller);
-- turn the status bubble on or off;
-- **Quit**.
+**Right-click menu** (everyday items only):
+- **Pause / Turn back on** (also a left-click on the icon)
+- **Microphone**, **Reading voice**, **Reading speed**
+- **Stop reading**
+- **Edit custom words...**
+- **Options...**
+- **Quit**
+
+**Options window** (set-and-forget settings, which apply as soon as you change them):
+
+| Tab | What's there |
+|---|---|
+| **General** | Show the status bubble · insert dictated text by Typing or Pasting · dictation model (Fast `base.en` / Accurate `small.en`) |
+| **Keys** | Change the dictation, read-aloud and stop keys (list, or "Press a key...") · reset to F9 / F10 / Esc |
+| **Tools** | Live session statistics · check for model updates now · check automatically at startup · open app folder · edit custom words · pin icon to taskbar |
+| **About** | Version, models and Python details, with a button to copy them for support |
+
+If Python was installed without tkinter (for example, the "embeddable" zip), the Options window can't open. The same settings then appear under **More** in the right-click menu.
 
 Your choices are saved in `settings.json`.
 
@@ -39,7 +50,7 @@ STATS dictation #3 | spoke 4.2s | transcribe 1.10s (0.26x real-time, base.en) | 
 STATS read-aloud #2 | 72 words / 412 chars in 6 chunk(s) | copy 0.12s | first sound 0.90s after F10 | synth 3.10s for 24.5s of speech (0.13x real-time) | played 24.5s (finished)
 ```
 
-"Real-time" compares the time taken with the length of the audio: 0.26x means 4 seconds of speech took about 1 second to process. Choose **Show statistics** in the tray menu to see totals for the session. A summary is also logged when you quit.
+"Real-time" compares the time taken with the length of the audio: 0.26x means 4 seconds of speech took about 1 second to process. **Options → Tools** shows live totals for the session. A summary is also logged when you quit.
 
 ## Downloading a release
 
@@ -149,7 +160,7 @@ Python itself is never removed. To reinstall, download the ZIP again and run `ru
 
 ## Changing the keys
 
-Right-click the tray icon and open **Keys**. Each function shows its current key:
+Open **Options → Keys**. Each function shows its current key:
 
 - **Dictation (hold): F9**
 - **Read aloud: F10**
