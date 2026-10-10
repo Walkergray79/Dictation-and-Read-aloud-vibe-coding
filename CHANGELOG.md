@@ -2,6 +2,9 @@
 
 The version number is shown in the tray icon's tooltip and in **About** in the tray menu. About also copies the details to the clipboard, ready to paste into an email or chat.
 
+## 1.8.0
+- **Open app folder** in the tray menu opens this copy's installation folder in File Explorer. That's where you'll find `custom_words.txt`, `settings.json`, the log and `uninstall.bat`.
+
 ## 1.7.0
 - **Keys** in the tray menu: change the dictation, read-aloud and stop keys. Pick a key from the list, or choose "Press a key to choose..." and press the key you want.
   - Changes apply immediately and are saved.

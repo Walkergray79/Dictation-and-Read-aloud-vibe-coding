@@ -24,6 +24,7 @@ Right-click the tray icon to:
 - choose the **microphone**, **reading voice**, **reading speed** and **dictation model** (Fast `base.en` / Accurate `small.en`);
 - choose how dictated text is inserted: **Typing** (default; works in most apps) or **Pasting** (faster for long text);
 - **Edit custom words**;
+- **Open app folder**: opens the installation folder in File Explorer (custom words, settings, log, uninstaller);
 - turn the status bubble on or off;
 - **Quit**.
 

@@ -113,7 +113,7 @@ import wave
 from pathlib import Path
 
 APP_NAME = "Dictation & Read-Aloud Helper"
-APP_VERSION = "1.7.0"  # bump on every release; see CHANGELOG.md
+APP_VERSION = "1.8.0"  # bump on every release; see CHANGELOG.md
 APP_DIR = Path(__file__).resolve().parent
 CACHE_DIR = APP_DIR / ".cache"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -1582,6 +1582,7 @@ class App:
                 Item("Check automatically at startup", lambda icon, item: self._set_setting(
                     "check_updates_on_start", not self.settings.check_updates_on_start),
                      checked=lambda item: bool(self.settings.check_updates_on_start)))),
+            Item("Open app folder", lambda icon, item: self._open_app_folder()),
             Item(f"About (version {APP_VERSION})", lambda icon, item: threading.Thread(
                 target=self._show_about, name="about", daemon=True).start()),
             Item("Pin icon to taskbar", lambda icon, item: threading.Thread(
@@ -1829,6 +1830,18 @@ class App:
             self._restore_bubble()
             self.flash("Model update failed - see the log", "error")
             self.notify(f"Model update failed: {exc}. The previous model is still in use.")
+
+    def _open_app_folder(self):
+        """Open this copy's installation folder (where dictation_app.py lives) in Explorer."""
+        log.info("Opening app folder: %s", APP_DIR)
+        try:
+            if IS_WINDOWS:
+                os.startfile(str(APP_DIR))
+            else:
+                subprocess.Popen(["xdg-open", str(APP_DIR)])
+        except Exception as exc:
+            log.exception("Could not open the app folder")
+            self.notify(f"Could not open {APP_DIR}: {exc}")
 
     def _show_stats(self):
         summary = self.stats.summary()
