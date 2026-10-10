@@ -146,11 +146,28 @@ Quit the helper from the tray first, then double-click **`uninstall.bat`**. It a
 
 Python itself is never removed. To reinstall, download the ZIP again and run `run_first_time.bat`.
 
+## Changing the keys
+
+Right-click the tray icon and open **Keys**. Each function shows its current key:
+
+- **Dictation (hold): F9**
+- **Read aloud: F10**
+- **Stop / cancel: Esc**
+
+Open one and either click a key in the list, or choose **Press a key to choose...** and press the key you want. The status bubble asks for the key; press Esc, or wait 10 seconds, to cancel. The new key works straight away and is remembered.
+
+- **Allowed keys:** F1–F24, Pause/Break, Scroll Lock, Insert, Print Screen, Right Ctrl and the Menu key.
+  - Letters, numbers, Enter, Shift and similar keys are refused, because a hotkey stops the key reaching other programs.
+  - Esc can only be the stop key.
+- **Clashes:** choosing a key another function already uses swaps the two keys.
+- **On laptops:** if the F keys control brightness or volume, you may need to hold **Fn**, or turn on Fn Lock, for F9 and F10. Pause or Right Ctrl can be easier.
+- **Reset to F9 / F10 / Esc** puts everything back.
+
 ## Configuration
 
 The constants at the top of `dictation_app.py` control the behaviour:
 
-- `DICTATE_KEY`, `READ_KEY`, `STOP_KEY`: can be `f1`…`f24`, `pause`, `scroll_lock`, `insert`, `ctrl_r`, or `menu`.
+- `DEFAULT_KEYS`: the starting hotkeys. Change them from the tray menu instead (see *Changing the keys*).
 - `DEFAULT_OUTPUT_MODE`: `"type"` or `"paste"` (also switchable in the tray menu). `PASTE_RESTORE_DELAY` sets how long paste mode waits before putting your clipboard back.
 - `MAX_RECORD_SECONDS`: a safety limit on recording length (120 s).
 - `READ_CLIPBOARD_IF_NO_SELECTION`, `MAX_READ_CHARS`, `VOICES`, `SPEEDS`.

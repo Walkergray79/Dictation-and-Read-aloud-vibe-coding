@@ -2,6 +2,14 @@
 
 The version number is shown in the tray icon's tooltip and in **About** in the tray menu. About also copies the details to the clipboard, ready to paste into an email or chat.
 
+## 1.7.0
+- **Keys** in the tray menu: change the dictation, read-aloud and stop keys. Pick a key from the list, or choose "Press a key to choose..." and press the key you want.
+  - Changes apply immediately and are saved.
+  - Choosing a key another function already uses swaps the two.
+  - Letters, Enter, Shift and similar typing keys are refused, so a hotkey can never block normal typing.
+  - Esc can only be the stop key.
+  - "Reset to F9 / F10 / Esc" restores the defaults.
+
 ## 1.6.0
 - Version number shown in the tray tooltip, the About box and the log.
 - About box with the app, model and Python versions. The details are copied to the clipboard.

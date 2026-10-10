@@ -8,6 +8,7 @@ A lightweight, fully offline dictation (speech-to-text) and read-aloud
     Hold  F9   -> dictate. Release to transcribe and type into the focused app.
     Press F10  -> read the highlighted text aloud (press F10 again to stop).
     Press Esc  -> stop reading / cancel a dictation in progress.
+    (All three keys can be changed from the tray menu: Keys.)
 
 Run once while online:      python dictation_app.py
 Afterwards (no console):    pythonw dictation_app.py
@@ -112,7 +113,7 @@ import wave
 from pathlib import Path
 
 APP_NAME = "Dictation & Read-Aloud Helper"
-APP_VERSION = "1.6.0"  # bump on every release; see CHANGELOG.md
+APP_VERSION = "1.7.0"  # bump on every release; see CHANGELOG.md
 APP_DIR = Path(__file__).resolve().parent
 CACHE_DIR = APP_DIR / ".cache"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -127,11 +128,41 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("HF_HUB_DISABLE_UPDATE_CHECK", "1")  # never query PyPI for new versions
 
 # ---- Hotkeys -----------------------------------------------------------------
-# Single keys only (no combos) so "hold to talk" is reliable. Supported names:
-# f1..f24, pause, scroll_lock, insert, ctrl_r (right Ctrl), menu (context-menu key)
-DICTATE_KEY = "f9"       # hold to dictate
-READ_KEY = "f10"         # press to read selection; press again to stop
-STOP_KEY = "esc"         # stops reading / cancels a recording (only swallowed while busy)
+# Changeable from the tray menu (Keys); these are the defaults. Single keys only
+# (no combos) so "hold to talk" is reliable, and only keys that aren't needed for
+# typing, because a hotkey is swallowed and never reaches other apps.
+DEFAULT_KEYS = {
+    "dictate": "f9",   # hold to dictate
+    "read": "f10",     # press to read the selection; press again to stop
+    "stop": "esc",     # stops reading / cancels a recording (only swallowed while busy)
+}
+HOTKEY_CHOICES = {  # name (as stored in settings.json): (Windows virtual-key code, label)
+    **{f"f{n}": (0x6F + n, f"F{n}") for n in range(1, 25)},
+    "esc": (0x1B, "Esc"),
+    "pause": (0x13, "Pause/Break"),
+    "scroll_lock": (0x91, "Scroll Lock"),
+    "insert": (0x2D, "Insert"),
+    "print_screen": (0x2C, "Print Screen"),
+    "ctrl_r": (0xA3, "Right Ctrl"),
+    "menu": (0x5D, "Menu key"),
+}
+ROLE_NAMES = {"dictate": "Dictation (hold)", "read": "Read aloud", "stop": "Stop / cancel"}
+KEYS = dict(DEFAULT_KEYS)  # the keys in use right now (loaded from settings at startup)
+
+
+def key_allowed(role: str, name: str) -> bool:
+    # Esc is too important to swallow all the time, so it can only be the stop key
+    # (which is only swallowed while the app is busy).
+    return name in HOTKEY_CHOICES and (name != "esc" or role == "stop")
+
+
+def key_label(role: str) -> str:
+    return HOTKEY_CHOICES[KEYS[role]][1]
+
+
+def with_keys(text: str) -> str:
+    """Fill {dictate} / {read} / {stop} placeholders with the current key names."""
+    return text.format(dictate=key_label("dictate"), read=key_label("read"), stop=key_label("stop"))
 
 # ---- Speech-to-text ----------------------------------------------------------
 WHISPER_MODELS = {"Fast (base.en)": "base.en", "Accurate (small.en)": "small.en"}
@@ -224,6 +255,9 @@ class Settings:
         self.show_bubble = True
         self.auto_pin_done = False  # tray icon auto-pinned once (Windows 11)
         self.check_updates_on_start = False  # off: the app stays fully offline
+        self.dictate_key = DEFAULT_KEYS["dictate"]
+        self.read_key = DEFAULT_KEYS["read"]
+        self.stop_key = DEFAULT_KEYS["stop"]
         try:
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
             for key in self.__dict__:
@@ -233,6 +267,19 @@ class Settings:
             pass
         except Exception as exc:
             log.warning("Could not read settings (%s); using defaults", exc)
+
+    def apply_keys(self):
+        """Copy the saved hotkeys into KEYS, falling back to the defaults if the
+        file holds an unknown key or the same key twice."""
+        wanted = {"dictate": self.dictate_key, "read": self.read_key, "stop": self.stop_key}
+        if (all(key_allowed(role, name) for role, name in wanted.items())
+                and len(set(wanted.values())) == 3):
+            KEYS.update(wanted)
+        else:
+            log.warning("Invalid hotkeys in settings (%s); using defaults", wanted)
+            KEYS.update(DEFAULT_KEYS)
+            self.dictate_key, self.read_key, self.stop_key = (DEFAULT_KEYS[r] for r in
+                                                              ("dictate", "read", "stop"))
 
     def save(self):
         try:
@@ -1001,9 +1048,6 @@ class Speaker:
 # =============================================================================
 # 8. GLOBAL HOTKEYS
 # =============================================================================
-_VK = {f"f{n}": 0x6F + n for n in range(1, 25)}
-_VK.update({"pause": 0x13, "scroll_lock": 0x91, "insert": 0x2D, "ctrl_r": 0xA3,
-            "menu": 0x5D, "esc": 0x1B})
 WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP = 0x100, 0x101, 0x104, 0x105
 LLKHF_INJECTED = 0x10
 
@@ -1016,11 +1060,13 @@ class HotkeyListener:
     onto a queue; the App's controller thread does the real work.
     On Windows our hotkeys are swallowed so F10 doesn't open app menus, etc."""
 
-    def __init__(self, events: queue.Queue, is_busy, is_paused):
+    def __init__(self, events: queue.Queue, is_busy, is_paused, is_capturing):
         self.events = events
-        self.is_busy = is_busy      # callable -> True while recording/speaking
-        self.is_paused = is_paused  # callable -> True when hotkeys are paused
-        self._down = set()          # hotkeys whose key-down we took (and swallowed)
+        self.is_busy = is_busy            # callable -> True while recording/speaking
+        self.is_paused = is_paused        # callable -> True when hotkeys are paused
+        self.is_capturing = is_capturing  # callable -> True while choosing a new key
+        self._down = set()                # hotkeys whose key-down we took (and swallowed)
+        self._capture_down = set()        # keys pressed while choosing a new key
         self._listener = None
 
     def start(self):
@@ -1068,8 +1114,21 @@ class HotkeyListener:
     def _win32_filter(self, msg, data):
         if data.flags & LLKHF_INJECTED:      # our own simulated Ctrl+C / Ctrl+V
             return True
-        names = {_VK[DICTATE_KEY]: "dictate", _VK[READ_KEY]: "read", _VK[STOP_KEY]: "stop"}
-        name = names.get(data.vkCode)
+        vk = data.vkCode
+        is_down = msg in (WM_KEYDOWN, WM_SYSKEYDOWN)
+        # "Press a key to choose": the next key press is captured, not acted on.
+        if vk in self._capture_down and not is_down:
+            self._capture_down.discard(vk)
+            self._listener.suppress_event()
+        if self.is_capturing():
+            if is_down:
+                if vk not in self._capture_down:
+                    self._capture_down.add(vk)
+                    self.events.put(("capture", vk))
+                self._listener.suppress_event()
+            return True
+        names = {HOTKEY_CHOICES[KEYS[role]][0]: role for role in ("dictate", "read", "stop")}
+        name = names.get(vk)
         if name is None:
             return True
         swallow = False
@@ -1086,10 +1145,10 @@ class HotkeyListener:
 
     # Non-Windows fallback (no key suppression) - handy for testing.
     def _key_name(self, key):
-        for cfg, name in ((DICTATE_KEY, "dictate"), (READ_KEY, "read"), (STOP_KEY, "stop")):
+        for role in ("dictate", "read", "stop"):
             try:
-                if key == getattr(keyboard.Key, cfg):
-                    return name
+                if key == getattr(keyboard.Key, KEYS[role]):
+                    return role
             except AttributeError:
                 pass
         return None
@@ -1293,7 +1352,7 @@ class Stats:
         first = f"{first_sound_s:.2f}s" if first_sound_s is not None else "-"
         log.info("STATS read-aloud #%d | %d words / %d chars in %d chunk(s) | copy %.2fs | "
                  "first sound %s after %s | synth %.2fs for %.1fs of speech (%.2fx real-time) | "
-                 "played %.1fs (%s)", n, words, len(text), chunks, copy_s, first, READ_KEY.upper(),
+                 "played %.1fs (%s)", n, words, len(text), chunks, copy_s, first, key_label("read"),
                  synth_s, speech_s, rtf, played_s, "stopped early" if stopped else "finished")
 
     def summary(self) -> str:
@@ -1364,20 +1423,20 @@ STATE_COLORS = {
 }
 STATE_LABELS = {  # tray tooltip / menu header
     "loading": "Loading speech models...",
-    "idle": f"Ready - hold {DICTATE_KEY.upper()} to dictate, {READ_KEY.upper()} to read",
+    "idle": "Ready - hold {dictate} to dictate, {read} to read",
     "recording": "Listening...",
     "transcribing": "Transcribing...",
     "preparing": "Getting ready to read...",
-    "speaking": f"Reading aloud ({READ_KEY.upper()}/{STOP_KEY.capitalize()} to stop)",
+    "speaking": "Reading aloud ({read}/{stop} to stop)",
     "error": "Model loading failed - see dictation_app.log",
     "paused": "Paused - click the icon to turn back on",
 }
 BUBBLE_TEXT = {  # on-screen status bubble; text ending in "..." gets animated dots
     "loading": "Loading speech models...",
-    "recording": f"Listening - let go of {DICTATE_KEY.upper()} when done",
+    "recording": "Listening - let go of {dictate} when done",
     "transcribing": "Writing down what you said...",
     "preparing": "Getting ready to read...",
-    "speaking": f"Reading aloud - {STOP_KEY.capitalize()} to stop",
+    "speaking": "Reading aloud - {stop} to stop",
 }
 FLASH_COLORS = {"ok": (30, 160, 80), "warn": (235, 160, 20), "error": (220, 40, 40)}
 
@@ -1402,7 +1461,8 @@ def make_icon(color, paused: bool = False) -> Image.Image:
 class App:
     def __init__(self):
         self.settings = Settings()
-        self.stt = None
+        self.settings.apply_keys()
+        self._capture_role = None  # set while "Press a key to choose" is waiting        self.stt = None
         self.tts = None
         self.state = "loading"
         self.events = queue.Queue()
@@ -1416,7 +1476,7 @@ class App:
         self._detail = None
         self.paused = False
         self._load_failed = False
-        self.hotkeys = HotkeyListener(self.events, self.is_busy, lambda: self.paused)
+        self.hotkeys = self._new_hotkey_listener()
         self._record_started = 0.0
         self._watchdog = None
         self._pending_transcriptions = 0
@@ -1447,6 +1507,7 @@ class App:
         self.state, self._detail = state, detail
         text = BUBBLE_TEXT.get(state)
         if text:
+            text = with_keys(text)
             if detail:
                 text = f"{text}  ({detail})"
             self.bubble.show(text, STATE_COLORS[state])
@@ -1456,7 +1517,7 @@ class App:
             try:
                 self.icon.icon = make_icon(STATE_COLORS.get(state, STATE_COLORS["idle"]),
                                            paused=(state == "paused"))
-                self.icon.title = f"{APP_NAME} v{APP_VERSION}\n{STATE_LABELS.get(state, state)}"[:127]
+                self.icon.title = f"{APP_NAME} v{APP_VERSION}\n{with_keys(STATE_LABELS.get(state, state))}"[:127]
                 self.icon.update_menu()
             except Exception:
                 pass
@@ -1501,13 +1562,14 @@ class App:
             # default=True -> a left-click on the tray icon toggles pause
             Item(lambda item: "Turn back on" if self.paused else "Pause (F9/F10 work as normal keys)",
                  lambda icon, item: self.toggle_pause(), default=True),
-            Item(lambda item: STATE_LABELS.get(self.state, self.state), None, enabled=False),
+            Item(lambda item: with_keys(STATE_LABELS.get(self.state, self.state)), None, enabled=False),
             Menu.SEPARATOR,
             Item("Microphone", Menu(mic_items)),
             Item("Reading voice", Menu(lambda: choice_items("voice", VOICES.items()))),
             Item("Reading speed", Menu(lambda: choice_items(
                 "speed", [(f"{s:g}x", s) for s in SPEEDS]))),
             Item("Dictation model", Menu(lambda: choice_items("whisper_model", WHISPER_MODELS.items()))),
+            Item("Keys", Menu(lambda: self._key_menu_items())),
             Item("Insert dictated text by", Menu(lambda: choice_items("output_mode", [
                 ("Typing (works in most apps)", "type"),
                 ("Pasting (faster for long text)", "paste")]))),
@@ -1546,6 +1608,124 @@ class App:
                 self.bubble.hide()
         self.icon.update_menu()
 
+    def _new_hotkey_listener(self):
+        return HotkeyListener(self.events, self.is_busy, lambda: self.paused,
+                              lambda: self._capture_role is not None)
+
+    # ---- changing the hotkeys ------------------------------------------------
+    def _key_menu_items(self):
+        Item, Menu = pystray.MenuItem, pystray.Menu
+        common = [f"f{n}" for n in range(1, 13)] + ["pause", "scroll_lock", "insert",
+                                                    "print_screen", "ctrl_r", "menu"]
+
+        def pick(role, name):
+            return lambda icon, item: self._assign_key(role, name)
+
+        def is_on(role, name):
+            return lambda item: KEYS[role] == name
+
+        def role_menu(role):
+            names = (["esc"] if role == "stop" else []) + common
+            if KEYS[role] not in names:  # e.g. F13 chosen by pressing it
+                names.append(KEYS[role])
+            return Menu(
+                Item("Press a key to choose...", lambda icon, item: self._start_key_capture(role)),
+                Menu.SEPARATOR,
+                *[Item(HOTKEY_CHOICES[n][1], pick(role, n), checked=is_on(role, n), radio=True)
+                  for n in names])
+
+        def label(role):
+            return lambda item: f"{ROLE_NAMES[role]}: {key_label(role)}"
+
+        return [Item(label(role), role_menu(role)) for role in ("dictate", "read", "stop")] + [
+            Menu.SEPARATOR,
+            Item(f"Reset to {HOTKEY_CHOICES[DEFAULT_KEYS['dictate']][1]} / "
+                 f"{HOTKEY_CHOICES[DEFAULT_KEYS['read']][1]} / "
+                 f"{HOTKEY_CHOICES[DEFAULT_KEYS['stop']][1]}",
+                 lambda icon, item: self._reset_keys())]
+
+    def _assign_key(self, role: str, name: str):
+        if not key_allowed(role, name):
+            self.flash(f"{HOTKEY_CHOICES.get(name, (0, name))[1]} can't be the "
+                       f"{ROLE_NAMES[role].lower()} key", "warn")
+            return
+        old = KEYS[role]
+        if name == old:
+            self.flash(f"{ROLE_NAMES[role]} key is already {HOTKEY_CHOICES[name][1]}")
+            return
+        message = f"{ROLE_NAMES[role]} key is now {HOTKEY_CHOICES[name][1]}"
+        for other in ("dictate", "read", "stop"):
+            if other != role and KEYS[other] == name:
+                if not key_allowed(other, old):
+                    self.flash(f"{HOTKEY_CHOICES[name][1]} is already the "
+                               f"{ROLE_NAMES[other].lower()} key", "warn")
+                    return
+                KEYS[other] = old  # swap, so no two functions share a key
+                message = (f"Swapped: {ROLE_NAMES[role]} = {HOTKEY_CHOICES[name][1]}, "
+                           f"{ROLE_NAMES[other]} = {HOTKEY_CHOICES[old][1]}")
+        KEYS[role] = name
+        self.settings.dictate_key, self.settings.read_key, self.settings.stop_key = (
+            KEYS["dictate"], KEYS["read"], KEYS["stop"])
+        self.settings.save()
+        self.hotkeys._down.clear()
+        log.info("Hotkeys changed: dictate=%s read=%s stop=%s", *(key_label(r) for r in
+                                                                  ("dictate", "read", "stop")))
+        self._refresh_key_labels()
+        self.flash(message)
+
+    def _reset_keys(self):
+        KEYS.update(DEFAULT_KEYS)
+        self.hotkeys._down.clear()
+        self.settings.dictate_key, self.settings.read_key, self.settings.stop_key = (
+            KEYS["dictate"], KEYS["read"], KEYS["stop"])
+        self.settings.save()
+        self._refresh_key_labels()
+        self.flash(with_keys("Keys reset: {dictate} dictate, {read} read, {stop} stop"))
+
+    def _refresh_key_labels(self):
+        try:
+            self.icon.title = f"{APP_NAME} v{APP_VERSION}\n{with_keys(STATE_LABELS.get(self.state, self.state))}"[:127]
+            self.icon.update_menu()
+        except Exception:
+            pass
+
+    def _start_key_capture(self, role: str):
+        if self.is_busy():
+            self.flash("Finish dictating or reading first", "warn")
+            return
+        self._capture_role = role
+        cancel = "Esc to cancel" if role != "stop" else "wait 10 s to cancel"
+        self.bubble.show(f"Press the new {ROLE_NAMES[role].lower()} key ({cancel})",
+                         STATE_COLORS["transcribing"])
+        timer = threading.Timer(10, self.events.put, (("capture_timeout", role),))
+        timer.daemon = True
+        timer.start()
+
+    def _on_key_captured(self, vk: int):
+        role = self._capture_role
+        if role is None:
+            return
+        name = next((n for n, (code, _) in HOTKEY_CHOICES.items() if code == vk), None)
+        if name == "esc" and role != "stop":
+            self._capture_role = None
+            self._restore_bubble()
+            self.flash("No change", "warn")
+            return
+        if name is None or not key_allowed(role, name):
+            # keep waiting - letters, Enter, Shift etc. are needed for typing
+            self.bubble.show("That key can't be used - try an F key, Pause or Insert",
+                             STATE_COLORS["transcribing"])
+            return
+        self._capture_role = None
+        self._restore_bubble()
+        self._assign_key(role, name)
+
+    def _on_capture_timeout(self, role: str):
+        if self._capture_role == role:
+            self._capture_role = None
+            self._restore_bubble()
+            self.flash("No key pressed - nothing changed", "warn")
+
     def toggle_pause(self):
         self.paused = not self.paused
         log.info("Hotkeys %s", "paused" if self.paused else "resumed")
@@ -1560,7 +1740,7 @@ class App:
                 self.set_state("idle")
             else:
                 self.set_state("error" if self._load_failed else "loading")
-            self.flash(f"On - hold {DICTATE_KEY.upper()} to dictate, {READ_KEY.upper()} to read")
+            self.flash(with_keys("On - hold {dictate} to dictate, {read} to read"))
         try:
             self.icon.update_menu()
         except Exception:
@@ -1631,7 +1811,7 @@ class App:
         """Put the bubble back to whatever the app is doing right now."""
         text = BUBBLE_TEXT.get(self.state)
         if text:
-            self.bubble.show(text, STATE_COLORS[self.state])
+            self.bubble.show(with_keys(text), STATE_COLORS[self.state])
         else:
             self.bubble.hide()
 
@@ -1688,12 +1868,12 @@ class App:
                      "in %.1fs", self.settings.whisper_model, stt_s, time.perf_counter() - tic)
             self.set_state("idle")
             chime("success")
-            self.flash(f"Ready - hold {DICTATE_KEY.upper()} to dictate, {READ_KEY.upper()} to read")
+            self.flash(with_keys("Ready - hold {dictate} to dictate, {read} to read"))
             if self.settings.check_updates_on_start:
                 threading.Thread(target=self._check_updates, args=(False,), name="update-check",
                                  daemon=True).start()
-            self.notify(f"Ready! Hold {DICTATE_KEY.upper()} to dictate, "
-                        f"press {READ_KEY.upper()} to read highlighted text.")
+            self.notify(with_keys("Ready! Hold {dictate} to dictate, "
+                                  "press {read} to read highlighted text."))
         except Exception as exc:
             log.exception("Model loading failed")
             self._load_failed = True
@@ -1762,7 +1942,7 @@ class App:
             if self._running and not self.hotkeys.alive():
                 log.warning("Hotkey listener stopped - restarting it")
                 try:
-                    self.hotkeys = HotkeyListener(self.events, self.is_busy, lambda: self.paused)
+                    self.hotkeys = self._new_hotkey_listener()
                     self.hotkeys.start()
                 except Exception:
                     log.exception("Could not restart hotkey listener")
@@ -1773,6 +1953,15 @@ class App:
             event = self.events.get()
             if event is None:
                 break
+            if isinstance(event, tuple):  # ("capture", vk) / ("capture_timeout", role)
+                try:
+                    if event[0] == "capture":
+                        self._on_key_captured(event[1])
+                    else:
+                        self._on_capture_timeout(event[1])
+                except Exception:
+                    log.exception("Error handling %s", event)
+                continue
             try:
                 handler = {
                     "dictate_down": self._on_dictate_down,
