@@ -10,14 +10,14 @@ An offline dictation (speech-to-text) and read-aloud (text-to-speech) tool for W
 
 **Chimes:** high rising = recording started · low falling = recording stopped · bright pop = text typed · low "bonk" = nothing heard, nothing selected, or an error.
 
-**Status bubble:** while the app is working, a small bubble appears near the bottom of the screen. It shows "Listening", "Writing down what you said", "Getting ready to read" and "Reading aloud (2 of 7)". It also shows short messages such as "Done" or "Nothing selected". The bubble never takes the keyboard focus, and clicks pass straight through it. You can turn it off in the tray menu.
+**Status bubble:** while the app is working, a small bubble appears near the bottom of the screen. It shows "Listening", "Writing down what you said", "Getting ready to read" and "Reading aloud (2 of 7)". It also shows short messages such as "Done" or "Nothing selected". The bubble never takes the keyboard focus, and clicks pass straight through it. You can turn it off in **Options → General**.
 
 **Tray icon colour:** grey = loading · blue = ready · red = listening · amber = transcribing · green = reading · grey with ⏸ = paused. No icon means the helper isn't running.
 
 **Pause:** **left-click** the tray icon (or choose *Pause* in its menu) to turn the hotkeys off. F9, F10 and Esc then work as normal keys in other apps. Click again to turn the helper back on. It always starts switched on.
 
 **Keeping the icon visible:**
-- On **Windows 11**, the helper pins its tray icon to the taskbar automatically the first time it runs, so it isn't hidden under the **^** arrow. If the icon disappears after a Python update, choose **Pin icon to taskbar** from its menu.
+- On **Windows 11**, the helper pins its tray icon to the taskbar automatically the first time it runs, so it isn't hidden under the **^** arrow. If the icon disappears after a Python update, use **Options → Tools → Pin icon to taskbar**.
 - On **Windows 10**, drag the icon from the **^** pop-up onto the taskbar once.
 
 **Right-click menu** (everyday items only):
@@ -63,12 +63,12 @@ Each version is published on the repository's **Releases** page (right-hand side
 ## Version & updates
 
 - **Which version am I running?**
-  - Hover over the tray icon, or choose **About** in its menu.
+  - Hover over the tray icon, or open **Options → About**.
   - About also copies the version, model and Python details to the clipboard, so colleagues can paste them into an email or chat.
   - What changed in each version is listed in `CHANGELOG.md`.
 - **Model updates:** the app never goes online by itself.
-  - **Updates → Check for model updates now** checks Hugging Face (dictation model), GitHub (voice model) and PyPI (speech engines). It reports what it finds and asks before downloading anything.
-  - **Updates → Check automatically at startup** does the same check quietly each time the app starts, and only pops up a message if something new is available. It's off by default.
+  - **Options → Tools → Check for model updates now** checks Hugging Face (dictation model), GitHub (voice model) and PyPI (speech engines). It reports what it finds and asks before downloading anything.
+  - **Check automatically at startup** (same place) does the same check quietly each time the app starts, and only pops up a message if something new is available. It's off by default.
 
 ## Custom words (acronyms, names, jargon)
 
@@ -179,8 +179,8 @@ Open one and either click a key in the list, or choose **Press a key to choose..
 
 The constants at the top of `dictation_app.py` control the behaviour:
 
-- `DEFAULT_KEYS`: the starting hotkeys. Change them from the tray menu instead (see *Changing the keys*).
-- `DEFAULT_OUTPUT_MODE`: `"type"` or `"paste"` (also switchable in the tray menu). `PASTE_RESTORE_DELAY` sets how long paste mode waits before putting your clipboard back.
+- `DEFAULT_KEYS`: the starting hotkeys. Change them in **Options → Keys** instead (see *Changing the keys*).
+- `DEFAULT_OUTPUT_MODE`: `"type"` or `"paste"` (also switchable in **Options → General**). `PASTE_RESTORE_DELAY` sets how long paste mode waits before putting your clipboard back.
 - `MAX_RECORD_SECONDS`: a safety limit on recording length (120 s).
 - `READ_CLIPBOARD_IF_NO_SELECTION`, `MAX_READ_CHARS`, `VOICES`, `SPEEDS`.
 
@@ -220,7 +220,7 @@ hook-health thread ──── restarts the keyboard hook if it ever dies
 ## Troubleshooting & limits on a locked-down PC
 
 - **Dictation is transcribed but the text doesn't appear:**
-  - Make sure the tray menu has **Insert dictated text by → Typing** selected.
+  - Make sure **Options → General → Insert dictated text by** is set to **Typing**.
   - Check `dictation_app.log`. Each dictation logs a line like `Inserting 42 chars by typing into: Document1 - Word`, which shows the window the app thought had focus.
   - If that window is right but nothing appears, the app may be running as administrator (see below).
 
