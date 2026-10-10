@@ -40,6 +40,14 @@ STATS read-aloud #2 | 72 words / 412 chars in 6 chunk(s) | copy 0.12s | first so
 
 "Real-time" compares the time taken with the length of the audio: 0.26x means 4 seconds of speech took about 1 second to process. Choose **Show statistics** in the tray menu to see totals for the session. A summary is also logged when you quit.
 
+## Downloading a release
+
+Each version is published on the repository's **Releases** page (right-hand side of the GitHub page) as `DictationHelper-vX.Y.Z.zip`. The ZIP contains only the files you need, with no nested folders.
+- **New install:** extract the ZIP to `C:\Users\<you>\DictationHelper\` and run `run_first_time.bat`.
+- **Update:** quit the helper, then extract the new ZIP into the same folder, replacing the files. Your `.cache` (models), `settings.json` and `custom_words.txt` are kept. Start the helper again.
+
+*For maintainers:* a release is created automatically when `main` gets a new `APP_VERSION` in `dictation_app.py`, using that version's section of `CHANGELOG.md` as the notes. You can also start it from **Actions → Release → Run workflow**.
+
 ## Version & updates
 
 - **Which version am I running?**

@@ -1,11 +1,17 @@
-# Publishes a GitHub release whenever a version tag (e.g. v1.6.0) is pushed.
+# Publishes a GitHub release for APP_VERSION (from dictation_app.py) when:
+#   * main is updated and that version has no release yet (so bumping
+#     APP_VERSION + CHANGELOG.md on main is all a new release needs),
+#   * a version tag such as v1.6.0 is pushed, or
+#   * someone clicks "Run workflow" on the Actions tab.
 # The release gets a clean ZIP with only the files a user needs, plus the
-# matching section of CHANGELOG.md as its notes.
+# matching section of CHANGELOG.md as its notes. The tag is created here.
 name: Release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,29 +22,47 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check the tag matches APP_VERSION
+      - name: Work out the version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           app=$(sed -n 's/^APP_VERSION = "\([^"]*\)".*/\1/p' dictation_app.py)
-          if [ "v$app" != "$GITHUB_REF_NAME" ]; then
+          tag="v$app"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "$tag" ]; then
             echo "::error::Tag $GITHUB_REF_NAME does not match APP_VERSION $app in dictation_app.py"
             exit 1
           fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists - nothing to do."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Check the script compiles
+        if: steps.version.outputs.exists == 'false'
         run: python3 -m py_compile dictation_app.py
 
       - name: Build the ZIP
+        if: steps.version.outputs.exists == 'false'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
           mkdir -p dist
-          zip -j "dist/DictationHelper-$GITHUB_REF_NAME.zip" \
+          zip -j "dist/DictationHelper-$TAG.zip" \
             dictation_app.py README.md CHANGELOG.md requirements.txt \
             run_first_time.bat run_silent.bat uninstall.bat
 
       - name: Release notes from CHANGELOG.md
+        if: steps.version.outputs.exists == 'false'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
           python3 - <<'PY'
           import os, re
-          version = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          version = os.environ["TAG"].lstrip("v")
           text = open("CHANGELOG.md", encoding="utf-8").read()
           m = re.search(rf"^## {re.escape(version)}\s*\n(.*?)(?=^## |\Z)", text, re.S | re.M)
           notes = (m.group(1).strip() if m else "See CHANGELOG.md.") + (
@@ -48,9 +72,11 @@ jobs:
           open("notes.md", "w", encoding="utf-8").write(notes)
           PY
 
-      - name: Create the release
+      - name: Create the release (and its tag)
+        if: steps.version.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "dist/DictationHelper-$GITHUB_REF_NAME.zip" \
-            --title "Dictation Helper $GITHUB_REF_NAME" --notes-file notes.md
+          gh release create "$TAG" "dist/DictationHelper-$TAG.zip" --target "$GITHUB_SHA" \
+            --title "Dictation Helper $TAG" --notes-file notes.md
