@@ -113,7 +113,7 @@ import wave
 from pathlib import Path
 
 APP_NAME = "Dictation & Read-Aloud Helper"
-APP_VERSION = "1.9.0"  # bump on every release; see CHANGELOG.md
+APP_VERSION = "1.10.0"  # bump on every release; see CHANGELOG.md
 APP_DIR = Path(__file__).resolve().parent
 CACHE_DIR = APP_DIR / ".cache"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -175,6 +175,54 @@ MAX_RECORD_SECONDS = 120         # watchdog in case the key-up event is lost
 #   "paste" - clipboard + Ctrl+V; faster for long text, but some apps read the clipboard late
 DEFAULT_OUTPUT_MODE = "type"
 PASTE_RESTORE_DELAY = 1.0        # seconds to wait before putting the old clipboard back
+
+# ---- CPU usage (Options -> General) ---------------------------------------------
+# "full" is the original behaviour. The others trade speed for a smaller CPU spike.
+CPU_MODES = {
+    "full": "Full speed (default)",
+    "balanced": "Balanced - half the cores, lower priority",
+    "gentle": "Gentle - 2 cores, lowest impact (slowest)",
+}
+DEFAULT_CPU_MODE = "full"
+
+
+def cpu_threads(mode: str) -> int:
+    full = max(1, min(8, os.cpu_count() or 4))
+    return {"balanced": max(1, full // 2), "gentle": min(2, full)}.get(mode, full)
+
+
+def beam_size(mode: str) -> int:
+    return 1 if mode == "gentle" else 5  # 1 = greedy decoding: about half the work
+
+
+def apply_cpu_priority(mode: str) -> None:
+    """Below-normal priority (and Windows 11 'Efficiency mode' for gentle) so other
+    programs always come first. Full speed restores the normal settings."""
+    if not IS_WINDOWS:
+        return
+    try:
+        k32 = ctypes.windll.kernel32
+        proc = k32.GetCurrentProcess()
+        k32.SetPriorityClass(proc, 0x20 if mode == "full" else 0x4000)  # NORMAL / BELOW_NORMAL
+
+        class PowerThrottling(ctypes.Structure):
+            _fields_ = [("Version", ctypes.c_ulong), ("ControlMask", ctypes.c_ulong),
+                        ("StateMask", ctypes.c_ulong)]
+        eco = mode == "gentle"
+        state = PowerThrottling(1, 1 if eco else 0, 1 if eco else 0)  # 0/0 = let Windows decide
+        k32.SetProcessInformation(proc, 4, ctypes.byref(state), ctypes.sizeof(state))
+    except Exception as exc:
+        log.debug("Could not set CPU priority: %s", exc)
+
+
+# ---- Recordings (Options -> Recordings) -------------------------------------------
+AUDIO_FILE_TYPES = [
+    ("Audio and video files", "*.wav *.m4a *.mp3 *.ogg *.oga *.opus *.flac *.aac *.wma *.amr "
+                              "*.3gp *.mp4 *.m4v *.mov *.webm *.mkv"),
+    ("All files", "*.*"),
+]
+PARAGRAPH_GAP_SECONDS = 2.0   # a pause this long in a recording starts a new paragraph
+PARAGRAPH_MAX_CHARS = 700     # ...and very long paragraphs are split at a sentence end
 
 # ---- Text-to-speech ----------------------------------------------------------
 KOKORO_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
@@ -255,6 +303,10 @@ class Settings:
         self.show_bubble = True
         self.auto_pin_done = False  # tray icon auto-pinned once (Windows 11)
         self.check_updates_on_start = False  # off: the app stays fully offline
+        self.cpu_mode = DEFAULT_CPU_MODE
+        self.file_model = "dictation"    # "dictation" = same model as dictation, or a model name
+        self.file_timestamps = False
+        self.file_open_when_done = True
         self.dictate_key = DEFAULT_KEYS["dictate"]
         self.read_key = DEFAULT_KEYS["read"]
         self.stop_key = DEFAULT_KEYS["stop"]
@@ -267,6 +319,12 @@ class Settings:
             pass
         except Exception as exc:
             log.warning("Could not read settings (%s); using defaults", exc)
+
+    def validate(self):
+        if self.cpu_mode not in CPU_MODES:
+            self.cpu_mode = DEFAULT_CPU_MODE
+        if self.file_model not in ("dictation", *WHISPER_MODELS.values()):
+            self.file_model = "dictation"
 
     def apply_keys(self):
         """Copy the saved hotkeys into KEYS, falling back to the defaults if the
@@ -600,7 +658,7 @@ def download_file(url: str, dest: Path) -> None:
     tmp.replace(dest)  # atomic: a half-finished download never looks complete
 
 
-def load_whisper(model_name: str):
+def load_whisper(model_name: str, threads: int = 0):
     from faster_whisper import WhisperModel
     from faster_whisper.utils import download_model
 
@@ -613,10 +671,11 @@ def load_whisper(model_name: str):
         log.info("Whisper model '%s' not cached yet - downloading (one time)...", model_name)
         download_model(model_name, output_dir=str(model_dir))
     return WhisperModel(str(model_dir), device="cpu", compute_type="int8",
-                        cpu_threads=max(1, min(8, (os.cpu_count() or 4))))
+                        cpu_threads=threads or cpu_threads("full"))
 
 
-def load_kokoro():
+def load_kokoro(threads: int = 0):
+    """threads=0 keeps ONNX Runtime's own default (all cores) - the Full speed setting."""
     from kokoro_onnx import Kokoro
 
     folder = CACHE_DIR / "kokoro"
@@ -635,6 +694,16 @@ def load_kokoro():
             log.warning("Could not download %s (%s); using the slower %s for now",
                         KOKORO_MODEL, exc, KOKORO_MODEL_FALLBACK)
             model = fallback
+    if threads:
+        try:
+            import onnxruntime as rt
+            opts = rt.SessionOptions()
+            opts.intra_op_num_threads = threads
+            opts.inter_op_num_threads = 1
+            session = rt.InferenceSession(str(model), opts, providers=["CPUExecutionProvider"])
+            return Kokoro.from_session(session, str(voices))
+        except Exception as exc:
+            log.warning("Could not limit read-aloud threads (%s); using the default", exc)
     return Kokoro(str(model), str(voices))
 
 
@@ -1324,6 +1393,203 @@ class StatusBubble:
             return None
 
 
+def decode_audio_file(path: Path) -> np.ndarray:
+    """Any audio/video file -> 16 kHz mono float32 for Whisper, using PyAV (installed
+    with faster-whisper). Done here rather than with faster_whisper.decode_audio,
+    which breaks with newer PyAV releases (it passes an option PyAV 19 removed)."""
+    import av
+    resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+    chunks = []
+
+    def keep(frames):
+        if frames is None:
+            return
+        for fr in (frames if isinstance(frames, list) else [frames]):
+            chunks.append(fr.to_ndarray().reshape(-1))
+
+    with av.open(str(path)) as container:
+        if not container.streams.audio:
+            raise ValueError("this file has no audio track")
+        for frame in container.decode(audio=0):
+            keep(resampler.resample(frame))
+        try:
+            keep(resampler.resample(None))  # flush the last few samples
+        except Exception:
+            pass
+    if not chunks:
+        raise ValueError("no audio could be read from this file")
+    return np.concatenate(chunks).astype(np.float32) / 32768.0
+
+
+class FileTranscriber:
+    """Transcribes recordings (WAV, M4A, MP3, ... even video) chosen in
+    Options -> Recordings. Runs in the background with its OWN copy of the
+    model, so dictation keeps working while a long file is processed.
+    Each transcript is saved as a .txt next to the recording."""
+
+    def __init__(self, app):
+        self.app = app
+        self._q = queue.Queue()
+        self._cancel = threading.Event()
+        self._model = None          # (name, threads, WhisperModel), freed when idle
+        self.status = "Idle"        # shown in the Options window
+        self.busy = False
+        self.done = self.total = 0
+        threading.Thread(target=self._run, name="file-transcriber", daemon=True).start()
+
+    def add(self, paths):
+        paths = [Path(p) for p in paths]
+        if not self.busy:
+            self.done, self.total = 0, 0
+        self.total += len(paths)
+        for path in paths:
+            self._q.put(path)
+        log.info("Queued %d recording(s) for transcription", len(paths))
+
+    def cancel(self):
+        if self.busy:
+            self._cancel.set()
+            while not self._q.empty():  # drop the files still waiting
+                try:
+                    self._q.get_nowait()
+                except queue.Empty:
+                    break
+
+    # ---- worker thread -------------------------------------------------------------
+    def _run(self):
+        while True:
+            path = self._q.get()
+            self.busy = True
+            self._cancel.clear()
+            try:
+                self._transcribe_file(path)
+            except Exception as exc:
+                log.exception("Could not transcribe %s", path)
+                self._progress(f"Failed: {path.name} ({type(exc).__name__})")
+                self.app.flash(f"Couldn't transcribe {path.name[:24]}", "error")
+            finally:
+                self.done += 1
+            if self._q.empty():
+                self.busy = False
+                self._model = None  # free the memory until it's needed again
+                if not self.status.startswith(("Failed", "Stopped")):
+                    self.status = f"Finished {self.done} file(s)"
+
+    def _get_model(self):
+        st = self.app.settings
+        name = st.whisper_model if st.file_model == "dictation" else st.file_model
+        threads = cpu_threads(st.cpu_mode)
+        if self._model is None or self._model[:2] != (name, threads):
+            if not (CACHE_DIR / "whisper" / name / "model.bin").exists():
+                self._progress(f"Downloading the {name} model (one time)...")
+            else:
+                self._progress(f"Loading the {name} model...")
+            self._model = (name, threads, load_whisper(name, threads))
+        return self._model[0], self._model[2]
+
+    def _progress(self, text, show_bubble=True):
+        self.status = text
+        if show_bubble and self.app.state in ("idle", "paused"):  # never cover dictation/reading
+            self.app.bubble.show(text, STATE_COLORS["transcribing"])
+
+    def _transcribe_file(self, path: Path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        app, st = self.app, self.app.settings
+        name, model = self._get_model()
+        count = f" ({self.done + 1} of {self.total})" if self.total > 1 else ""
+        short = path.name if len(path.name) <= 28 else path.name[:25] + "..."
+        self._progress(f"Transcribing {short}...{count}")
+        tic = time.perf_counter()
+        audio = decode_audio_file(path)  # WAV, M4A, MP3, OGG, FLAC, MP4, ...
+        segments, info = model.transcribe(
+            audio,
+            language="en" if name.endswith(".en") else None,
+            beam_size=beam_size(st.cpu_mode),
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500},
+            condition_on_previous_text=False,
+            initial_prompt=app.vocab.prompt(),
+        )
+        duration = float(getattr(info, "duration", 0) or 0) or audio.size / SAMPLE_RATE
+        paragraphs, current, start, last_end = [], [], 0.0, None
+        stopped = False
+
+        def flush():
+            if current:
+                paragraphs.append((start, app.vocab.fix(" ".join(current))))
+                current.clear()
+
+        for seg in segments:
+            if self._cancel.is_set():
+                stopped = True
+                break
+            text = seg.text.strip()
+            if not text:
+                continue
+            gap = seg.start - last_end if last_end is not None else 0
+            if gap >= PARAGRAPH_GAP_SECONDS or (
+                    sum(map(len, current)) > PARAGRAPH_MAX_CHARS and current[-1][-1:] in ".!?"):
+                flush()
+            if not current:
+                start = seg.start
+            current.append(text)
+            last_end = seg.end
+            if duration:
+                pct = min(99, int(seg.end * 100 / duration))
+                self._progress(f"Transcribing {short} - {pct}%{count}")
+        flush()
+
+        def stamp(sec):
+            sec = int(sec)
+            return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}" if sec >= 3600 \
+                else f"{sec // 60:02d}:{sec % 60:02d}"
+
+        body = "\n\n".join(f"[{stamp(t)}] {txt}" if st.file_timestamps else txt
+                           for t, txt in paragraphs)
+        header = (f"Transcript of {path.name} ({stamp(duration)})\n"
+                  f"Made {time.strftime('%d %b %Y %H:%M')} by {APP_NAME} v{APP_VERSION}, "
+                  f"model {name}\n\n")
+        footer = "\n\n[Stopped early - the rest of the recording was not transcribed]" if stopped else ""
+        out = self._write(path, header + (body or "(No speech was recognised.)") + footer + "\n")
+        took = time.perf_counter() - tic
+        words = len(body.split())
+        log.info("STATS file | %s | %s of audio | transcribed in %.1fs (%.2fx real-time, %s) | "
+                 "%d words | saved %s%s", path.name, stamp(duration), took,
+                 took / duration if duration else 0, name, words, out, " | STOPPED" if stopped else "")
+        if stopped:
+            self.status = f"Stopped - partial transcript saved as {out.name}"
+            app.flash("Stopped - partial transcript saved", "warn")
+        else:
+            self.status = f"Saved {out.name}"
+            app.flash(f"Transcript saved: {out.name[:28]}")
+        if st.file_open_when_done:
+            try:
+                if IS_WINDOWS:
+                    os.startfile(str(out))
+            except Exception:
+                log.debug("Could not open %s", out, exc_info=True)
+
+    @staticmethod
+    def _write(recording: Path, text: str) -> Path:
+        """Save next to the recording (never overwriting), or in Documents if
+        that folder is read-only (e.g. a phone or network share)."""
+        folders = [recording.parent, Path.home() / "Documents" / "Dictation Transcripts"]
+        for folder in folders:
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+                out = folder / (recording.stem + ".txt")
+                n = 2
+                while out.exists():
+                    out = folder / f"{recording.stem} ({n}).txt"
+                    n += 1
+                out.write_text(text, encoding="utf-8")
+                return out
+            except OSError:
+                continue
+        raise OSError("Could not save the transcript anywhere")
+
+
 class OptionsWindow:
     """The Options window: everything you set once and rarely touch again,
     kept out of the right-click menu. Runs on the Tk thread (see StatusBubble.call).
@@ -1347,6 +1613,7 @@ class OptionsWindow:
         tabs.pack(fill="both", expand=True, padx=10, pady=(10, 0))
         self._general_tab(tabs)
         self._keys_tab(tabs)
+        self._recordings_tab(tabs)
         self._tools_tab(tabs)
         self._about_tab(tabs)
         ttk.Button(win, text="Close", command=self.close).pack(anchor="e", padx=10, pady=10)
@@ -1383,6 +1650,18 @@ class OptionsWindow:
                             command=lambda: app._set_setting("output_mode", self.v_output.get())
                             ).pack(anchor="w")
 
+        box = ttk.LabelFrame(f, text="CPU usage (dictation, read-aloud and recordings)", padding=8)
+        box.pack(fill="x", pady=8)
+        self.v_cpu = tk.StringVar()
+        for value, label in CPU_MODES.items():
+            ttk.Radiobutton(box, text=label, value=value, variable=self.v_cpu,
+                            command=lambda: app._set_setting("cpu_mode", self.v_cpu.get())
+                            ).pack(anchor="w")
+        ttk.Label(box, wraplength=440, justify="left", foreground="#555555", text=(
+            "Lower settings stop the processor spiking and keep other programs smooth, "
+            "but transcription takes longer. The STATS lines in the log show the difference."
+        )).pack(anchor="w", pady=(4, 0))
+
         box = ttk.LabelFrame(f, text="Dictation model", padding=8)
         box.pack(fill="x", pady=8)
         self.v_model = tk.StringVar()
@@ -1416,6 +1695,54 @@ class OptionsWindow:
             "Esc can only be the stop key. Picking a key that's already used swaps the two. "
             "On laptops where F keys change brightness/volume, Right Ctrl or Pause can be easier."
         )).grid(row=4, column=0, columnspan=3, sticky="w")
+
+    def _recordings_tab(self, tabs):
+        tk, ttk, app = self.tk, self.ttk, self.app
+        f = ttk.Frame(tabs, padding=14)
+        tabs.add(f, text="Recordings")
+        ttk.Label(f, wraplength=440, justify="left", text=(
+            "Turn recordings into text - for example voice memos from your phone. "
+            "Works with WAV, M4A, MP3, OGG, FLAC, AAC and video files such as MP4. "
+            "The text is saved as a .txt file next to each recording."
+        )).pack(anchor="w")
+        ttk.Button(f, text="Choose audio files to transcribe...",
+                   command=self._choose_files).pack(anchor="w", pady=10)
+
+        box = ttk.LabelFrame(f, text="Model for recordings", padding=8)
+        box.pack(fill="x")
+        self.v_file_model = tk.StringVar()
+        for label, value in (("Same as dictation", "dictation"),
+                             ("Fast (base.en)", "base.en"),
+                             ("Accurate (small.en) - best for long or noisy recordings", "small.en")):
+            ttk.Radiobutton(box, text=label, value=value, variable=self.v_file_model,
+                            command=lambda: app._set_setting("file_model", self.v_file_model.get())
+                            ).pack(anchor="w")
+        ttk.Label(box, foreground="#555555", text="Accurate is about 3x slower and downloads "
+                  "once (~480 MB, needs internet the first time).").pack(anchor="w", pady=(4, 0))
+        self.v_stamps = tk.BooleanVar()
+        ttk.Checkbutton(f, text="Add timestamps, e.g. [02:15], at the start of each paragraph",
+                        variable=self.v_stamps,
+                        command=lambda: app._set_setting("file_timestamps", self.v_stamps.get())
+                        ).pack(anchor="w", pady=(10, 2))
+        self.v_open = tk.BooleanVar()
+        ttk.Checkbutton(f, text="Open the transcript when it's finished", variable=self.v_open,
+                        command=lambda: app._set_setting("file_open_when_done", self.v_open.get())
+                        ).pack(anchor="w")
+
+        box = ttk.LabelFrame(f, text="Progress", padding=8)
+        box.pack(fill="x", pady=(10, 0))
+        self.v_file_status = tk.StringVar()
+        ttk.Label(box, textvariable=self.v_file_status, wraplength=420, justify="left"
+                  ).pack(side="left", anchor="w")
+        self.cancel_btn = ttk.Button(box, text="Stop", command=app.files.cancel)
+        self.cancel_btn.pack(side="right")
+
+    def _choose_files(self):
+        from tkinter import filedialog
+        paths = filedialog.askopenfilenames(parent=self.win, title="Choose recordings to transcribe",
+                                            filetypes=AUDIO_FILE_TYPES)
+        if paths:
+            self.app.files.add(paths)
 
     def _tools_tab(self, tabs):
         tk, ttk, app = self.tk, self.ttk, self.app
@@ -1475,6 +1802,12 @@ class OptionsWindow:
         self.v_output.set(st.output_mode)
         self.v_model.set(st.whisper_model)
         self.v_autoupdate.set(bool(st.check_updates_on_start))
+        self.v_cpu.set(st.cpu_mode)
+        self.v_file_model.set(st.file_model)
+        self.v_stamps.set(bool(st.file_timestamps))
+        self.v_open.set(bool(st.file_open_when_done))
+        self.v_file_status.set(self.app.files.status)
+        self.cancel_btn.configure(state="normal" if self.app.files.busy else "disabled")
         for role, box in self.key_boxes.items():
             box.set(HOTKEY_CHOICES[KEYS[role]][1])
         self.v_stats.set(self.app.stats.summary().replace("STATS session | ", "")
@@ -1649,6 +1982,7 @@ class App:
     def __init__(self):
         self.settings = Settings()
         self.settings.apply_keys()
+        self.settings.validate()
         self._capture_role = None  # set while "Press a key to choose" is waiting        self.stt = None
         self.tts = None
         self.state = "loading"
@@ -1661,6 +1995,7 @@ class App:
         self.bubble = StatusBubble()
         self.bubble.enabled = bool(self.settings.show_bubble)
         self._options = None  # the Options window, while open
+        self.files = FileTranscriber(self)
         self._detail = None
         self.paused = False
         self._load_failed = False
@@ -1809,6 +2144,9 @@ class App:
         setattr(self.settings, key, value)
         self.settings.save()
         log.info("Setting %s = %r", key, value)
+        if key == "cpu_mode" and value != old:
+            apply_cpu_priority(value)
+            threading.Thread(target=self._reload_for_cpu_mode, name="model-loader", daemon=True).start()
         if key == "whisper_model" and value != old:
             threading.Thread(target=self._reload_whisper, name="model-loader", daemon=True).start()
         if key == "show_bubble":
@@ -2029,7 +2367,7 @@ class App:
         try:
             self.bubble.show("Downloading model update...", STATE_COLORS["loading"])
             update_whisper_model(name)
-            self.stt = load_whisper(name)
+            self.stt = load_whisper(name, cpu_threads(self.settings.cpu_mode))
             log.info("Dictation model %s updated to %s", name, whisper_local_revision(name))
             self._restore_bubble()
             self.flash("Model updated")
@@ -2078,10 +2416,10 @@ class App:
     def _load_models(self):
         try:
             tic = time.perf_counter()
-            self.stt = load_whisper(self.settings.whisper_model)
+            self.stt = load_whisper(self.settings.whisper_model, cpu_threads(self.settings.cpu_mode))
             stt_s = time.perf_counter() - tic
             tic = time.perf_counter()
-            self.tts = load_kokoro()
+            self.tts = load_kokoro(self._tts_threads())
             if self.settings.voice not in self.tts.get_voices():
                 self.settings.voice = DEFAULT_VOICE
             self.tts.create("Ready.", voice=self.settings.voice, speed=1.0, lang="en-us")  # warm-up
@@ -2108,10 +2446,32 @@ class App:
             self.flash("Could not load models - see the log", "error")
             self.notify(f"Could not load speech models. {hint}")
 
+    def _tts_threads(self) -> int:
+        mode = self.settings.cpu_mode
+        return 0 if mode == "full" else cpu_threads(mode)
+
+    def _reload_for_cpu_mode(self):
+        """Thread counts are fixed when a model loads, so reload both. The old
+        models keep working until the new ones are ready."""
+        if self.stt is None or self.tts is None:
+            return  # still starting up - the new setting is used anyway
+        mode = self.settings.cpu_mode
+        try:
+            tic = time.perf_counter()
+            stt = load_whisper(self.settings.whisper_model, cpu_threads(mode))
+            tts = load_kokoro(self._tts_threads())
+            self.stt, self.tts = stt, tts
+            log.info("CPU usage set to %s (%d threads, beam %d) - models reloaded in %.1fs",
+                     mode, cpu_threads(mode), beam_size(mode), time.perf_counter() - tic)
+            self.flash(f"CPU usage: {CPU_MODES[mode].split(' - ')[0].replace(' (default)', '')}")
+        except Exception:
+            log.exception("Could not apply the CPU setting")
+            self.flash("Couldn't apply the CPU setting - see the log", "error")
+
     def _reload_whisper(self):
         try:
             self.set_state("loading")
-            model = load_whisper(self.settings.whisper_model)
+            model = load_whisper(self.settings.whisper_model, cpu_threads(self.settings.cpu_mode))
             self.stt = model
             log.info("Switched dictation model to %s", self.settings.whisper_model)
         except Exception as exc:
@@ -2122,6 +2482,7 @@ class App:
 
     def _setup(self, icon):
         icon.visible = True
+        apply_cpu_priority(self.settings.cpu_mode)
         self.bubble.show(BUBBLE_TEXT["loading"], STATE_COLORS["loading"])
         if IS_WINDOWS and len(str(APP_DIR)) > LONG_PATH_WARNING:
             log.warning("App folder path is %d characters long: %s", len(str(APP_DIR)), APP_DIR)
@@ -2341,7 +2702,7 @@ class App:
         segments, _info = self.stt.transcribe(
             audio,
             language="en" if model_name.endswith(".en") else None,
-            beam_size=5,
+            beam_size=beam_size(self.settings.cpu_mode),
             vad_filter=True,                       # drops silence -> fewer hallucinations
             vad_parameters={"min_silence_duration_ms": 500},
             condition_on_previous_text=False,

@@ -32,7 +32,8 @@ An offline dictation (speech-to-text) and read-aloud (text-to-speech) tool for W
 
 | Tab | What's there |
 |---|---|
-| **General** | Show the status bubble · insert dictated text by Typing or Pasting · dictation model (Fast `base.en` / Accurate `small.en`) |
+| **General** | Show the status bubble · insert dictated text by Typing or Pasting · **CPU usage** (Full speed / Balanced / Gentle) · dictation model (Fast `base.en` / Accurate `small.en`) |
+| **Recordings** | Transcribe audio files (WAV, M4A, MP3, MP4...) to `.txt` · model for recordings · timestamps · progress and Stop |
 | **Keys** | Change the dictation, read-aloud and stop keys (list, or "Press a key...") · reset to F9 / F10 / Esc |
 | **Tools** | Live session statistics · check for model updates now · check automatically at startup · open app folder · edit custom words · pin icon to taskbar |
 | **About** | Version, models and Python details, with a button to copy them for support |
@@ -69,6 +70,26 @@ Each version is published on the repository's **Releases** page (right-hand side
 - **Model updates:** the app never goes online by itself.
   - **Options → Tools → Check for model updates now** checks Hugging Face (dictation model), GitHub (voice model) and PyPI (speech engines). It reports what it finds and asks before downloading anything.
   - **Check automatically at startup** (same place) does the same check quietly each time the app starts, and only pops up a message if something new is available. It's off by default.
+
+## Transcribing recordings
+
+Recorded something on your phone? Copy the file to your PC, then open **Options → Recordings → Choose audio files to transcribe...** You can pick several files at once.
+
+- **Formats:** WAV, M4A (iPhone voice memos), MP3, OGG, FLAC, AAC, and the sound from video files such as MP4.
+- **Where the text goes:** each transcript is saved as a `.txt` file next to its recording, e.g. `meeting.m4a` → `meeting.txt`. Existing files are never overwritten; a new one is saved as `meeting (2).txt`. If that folder is read-only, the transcript goes to `Documents\Dictation Transcripts`.
+- **Layout:** a new paragraph starts wherever there's a pause of about 2 seconds. Tick *Add timestamps* to put `[02:15]` at the start of each paragraph. Your custom words are applied.
+- **Model:** **Accurate (`small.en`)** is best for long or noisy recordings. It's about 3× slower and downloads once (~480 MB). As a rough guide, the Fast model handles 10 minutes of audio in about 1–3 minutes on a normal laptop.
+- **Progress:** progress shows in the Recordings tab and the status bubble. Dictation keeps working while a recording is processed. **Stop** saves the part already done.
+
+## CPU usage
+
+When you release the dictation key, Whisper briefly uses several processor cores at full power. In **Options → General → CPU usage** you can choose:
+
+- **Full speed** (default): fastest. The processor spikes for a second or two.
+- **Balanced:** uses half the cores, at lower priority, so other programs always come first.
+- **Gentle:** uses 2 cores and a simpler search, with Windows *Efficiency mode*. It has the least impact, but is slowest; good on battery.
+
+The setting applies to dictation, read-aloud and recordings, and takes effect straight away. Compare the `STATS` lines in the log to see what it costs on your PC.
 
 ## Custom words (acronyms, names, jargon)
 

@@ -2,6 +2,21 @@
 
 The version number is shown in the tray icon's tooltip and in **About** in the tray menu. About also copies the details to the clipboard, ready to paste into an email or chat.
 
+## 1.10.0
+- **Transcribe recordings:** use **Options → Recordings → Choose audio files to transcribe...**
+  - Works with WAV, M4A (iPhone voice memos), MP3, OGG, FLAC, AAC and video files such as MP4.
+  - The text is saved as a `.txt` next to each recording. It never overwrites an existing file; if the folder is read-only, it saves to Documents\Dictation Transcripts instead.
+  - Paragraphs break at natural pauses, with optional `[mm:ss]` timestamps. Custom words are applied.
+  - Choose the model for recordings: same as dictation, Fast or Accurate.
+  - Runs in the background with its own copy of the model, so dictation keeps working. Progress shows in Options and the status bubble, and **Stop** saves what's done so far.
+- **CPU usage** setting in **Options → General**:
+  - **Full speed** (default, unchanged);
+  - **Balanced**: half the cores, below-normal priority;
+  - **Gentle**: 2 cores, simpler decoding, Windows Efficiency mode.
+
+  It applies to dictation, read-aloud and recordings, and takes effect without a restart.
+- `STATS file` lines in the log for each transcribed recording.
+
 ## 1.9.0
 - New **Options** window (right-click menu → **Options...**) for the set-and-forget settings, so the right-click menu only has everyday items.
   - **General:** status bubble, Typing/Pasting, dictation model.
