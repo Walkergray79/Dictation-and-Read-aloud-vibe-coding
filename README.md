@@ -101,6 +101,8 @@ share point -> SharePoint <- a fix-up: replace what dictation wrote with what yo
 NMUK = N M U K           <- a pronunciation: how read-aloud should say the word
 ```
 
+**Not sure how to write a word?** Open `custom_words_prompt.txt` in the app folder. It's a ready-made prompt for Gemini, ChatGPT or any AI chat that explains this format. Paste it in, add your word, and copy the answer into `custom_words.txt`.
+
 Acronyms in capitals are also fixed when dictation spells them out. For example, "N M U K", "N.M.U.K." and "NM UK" all become "NMUK". Ordinary lowercase words are left alone, so adding `IT` won't change "it".
 
 ## Engines

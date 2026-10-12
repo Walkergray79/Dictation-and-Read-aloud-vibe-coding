@@ -2,6 +2,9 @@
 
 The version number is shown in the tray icon's tooltip and in **About** in the tray menu. About also copies the details to the clipboard, ready to paste into an email or chat.
 
+## 1.11.1
+- New `custom_words_prompt.txt` in the app folder: a ready-made prompt for Gemini, ChatGPT or any AI chat. Paste it in with a word (e.g. DCS[N]) and it answers with lines in the exact `custom_words.txt` format, ready to copy across. It's included in the release ZIP and the portable bundle.
+
 ## 1.11.0
 - **Portable bundle:** `make_portable_bundle.bat` builds a self-contained folder and ZIP on a PC with internet: a portable Python, all the packages and the speech models. Copy it to a work PC and run it, with no Python install, no admin rights and no internet needed.
 - The `.bat` launchers find a portable Python automatically: a bundled `python\` folder, then WinPython next to the app, then the installed Python. `run_first_time.bat` shows which one is used.

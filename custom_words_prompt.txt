@@ -1,0 +1,89 @@
+=====================================================================
+ PROMPT FOR GEMINI (or any AI chat) - writing lines for custom_words.txt
+ How to use: copy everything between the START and END lines into a new
+ chat, then add your word at the bottom where it says "MY WORD". In the
+ same chat you can then just send more words, one message each.
+=====================================================================
+
+----- START COPYING HERE -----
+
+You are helping me add entries to "custom_words.txt", the custom vocabulary file of my offline dictation and read-aloud app. Dictation uses OpenAI Whisper (via faster-whisper). Read-aloud uses the Kokoro voice, which works out pronunciation with espeak. Your answer must follow the file format below EXACTLY, because the app reads it with a simple parser.
+
+THE FILE FORMAT - one entry per line; there are 3 kinds of line:
+
+1) RECOGNITION WORD - a line with just the word, e.g.
+   NMUK
+   - Whisper is given these words as a hint, so it prefers that spelling.
+   - If the word is ALL CAPITAL LETTERS (A-Z only, no digits or symbols), the app ALSO automatically fixes spelled-out versions: "N M U K", "N.M.U.K.", "N-M-U-K" and "NM UK" all become "NMUK". Plain lowercase words such as "it" are never changed by this.
+   - Keep the total number of recognition words modest (the hint is limited to about 400 characters).
+
+2) FIX-UP - what dictation wrote -> what I want typed, e.g.
+   share point -> SharePoint
+   - Format: text, space, "->", space, replacement.
+   - Matches WHOLE WORDS only and IGNORES upper/lower case on the left side.
+   - The replacement is typed exactly as written (any characters allowed, e.g. [ ] & /), EXCEPT a backslash: NEVER use the \ character.
+   - Fix-ups run in the order they appear in the file, BEFORE the automatic acronym clean-up from rule 1.
+   - DANGER: because matching ignores case, never put a common English word on the left, e.g. "it -> IT", "us -> US", "aim -> AIM". That would change normal speech. Only use left-hand text that would not appear in normal sentences.
+
+3) PRONUNCIATION - word = how read-aloud should say it, e.g.
+   NMUK = N M U K
+   - Format: word, space, "=", space, spoken form.
+   - The left side must match EXACTLY as written, including capitals. Whole word only.
+   - Write the right side as plain sounds-like spelling:
+     - letters separated by spaces to spell it out: "N M U K";
+     - a phonetic respelling for names: "Esme = Ezmee".
+   - Without this line, the voice may try to pronounce an acronym as a word (e.g. NMUK came out as "en-muck"). So add one whenever the pronunciation matters.
+   - A pronunciation line also counts as a recognition word.
+   - Never use "->" in a pronunciation line.
+
+GENERAL RULES
+- Lines starting with # are comments and are ignored. Blank lines are ignored.
+- No backslashes anywhere. No quotes around words. No bullet points or numbering in the lines.
+- Whisper NEVER writes brackets, slashes or most symbols. When the wanted form contains them (e.g. DCS[N], C&D, R/D), you must add fix-ups from every likely plain version to the wanted form.
+- Likely ways Whisper writes things you should cover with fix-ups when they differ from the wanted form:
+  - Acronyms: usually solid capitals ("DCSN"), sometimes with spaces ("DCS N", "D C S N") or dots ("D.C.S.N.", which you should write with the final dot included).
+  - Names: phonetic misspellings (Esme -> "Esmay", "Ezme").
+  - Mixed-case brand words: split or lowercase ("share point", "power bi").
+  - Numbers: digits or words, and split letters/digits ("A320", "A 320", "A three twenty").
+- For an ALL-CAPS word made only of letters, the automatic clean-up already covers spaces/dots/hyphens, so fix-ups are only needed if the wanted form has symbols, mixed case or digits.
+- If it is unclear whether something is said letter by letter or as a word, assume letter by letter for all-caps words of 5 letters or fewer, and say what you assumed.
+
+HOW TO ANSWER
+1. First, ONE code block containing only the lines to paste, starting with a comment line naming the word, e.g. "# DCS[N]". Order inside the block: recognition word(s), then fix-ups, then the pronunciation line.
+2. Then a short plain-English list explaining what each line does (one line each). Keep it brief - I am dyslexic, so short sentences please.
+3. Then, if useful, ONE short note about any risk (e.g. a fix-up that might change normal words) or anything to watch for.
+
+WORKED EXAMPLES (follow this style)
+
+Example A - word: DCS[N], said as "D C S N" (letters):
+# DCS[N]
+DCSN
+DCSN -> DCS[N]
+DCS N -> DCS[N]
+D C S N -> DCS[N]
+D.C.S.N. -> DCS[N]
+DCS[N] = D C S N
+
+Example B - name: Esme, said "EZ-mee":
+# Esme
+Esme
+Esmay -> Esme
+Ezme -> Esme
+Esme = Ezmee
+
+Example C - word: SharePoint:
+# SharePoint
+SharePoint
+share point -> SharePoint
+
+Example D - acronym: NMUK, said letter by letter (plain capitals, so no fix-ups needed):
+# NMUK
+NMUK
+NMUK = N M U K
+
+MY WORD:
+Word as it should be typed:
+How it is said out loud:
+(optional) What dictation currently types by mistake:
+
+----- END COPYING HERE -----

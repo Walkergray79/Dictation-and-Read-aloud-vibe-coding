@@ -69,7 +69,7 @@ rd /s /q "%APPDIR%\python"
 :skip_packages
 
 echo [5/5] Deleting the app files...
-del /q "dictation_app.py" "README.md" "CHANGELOG.md" "requirements.txt" ".gitignore" "run_first_time.bat" "run_silent.bat" "find_python.bat" "make_portable_bundle.bat" 2>nul
+del /q "dictation_app.py" "README.md" "CHANGELOG.md" "requirements.txt" ".gitignore" "run_first_time.bat" "run_silent.bat" "find_python.bat" "make_portable_bundle.bat" "custom_words_prompt.txt" 2>nul
 
 echo.
 echo Uninstall complete. If a helper icon is still in the system tray,

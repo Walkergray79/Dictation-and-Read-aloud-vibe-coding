@@ -59,7 +59,7 @@ REM uv marks its Pythons "externally managed"; this one is ours, so allow pip.
 if exist "%OUT%\python\Lib\EXTERNALLY-MANAGED" del /q "%OUT%\python\Lib\EXTERNALLY-MANAGED"
 
 echo [3/5] Copying the app files...
-for %%F in (dictation_app.py README.md CHANGELOG.md requirements.txt find_python.bat run_first_time.bat run_silent.bat uninstall.bat) do (
+for %%F in (dictation_app.py README.md CHANGELOG.md requirements.txt custom_words_prompt.txt find_python.bat run_first_time.bat run_silent.bat uninstall.bat) do (
     if exist "%%F" copy /y "%%F" "%OUT%\" >nul
 )
 if /i "%COPYWORDS%"=="Y" copy /y "custom_words.txt" "%OUT%\" >nul

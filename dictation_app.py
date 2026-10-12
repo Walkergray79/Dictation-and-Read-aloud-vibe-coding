@@ -116,7 +116,7 @@ import wave
 from pathlib import Path
 
 APP_NAME = "Dictation & Read-Aloud Helper"
-APP_VERSION = "1.11.0"  # bump on every release; see CHANGELOG.md
+APP_VERSION = "1.11.1"  # bump on every release; see CHANGELOG.md
 APP_DIR = Path(__file__).resolve().parent
 CACHE_DIR = APP_DIR / ".cache"
 SETTINGS_FILE = APP_DIR / "settings.json"
