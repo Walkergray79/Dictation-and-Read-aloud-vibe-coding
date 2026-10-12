@@ -2,6 +2,12 @@
 
 The version number is shown in the tray icon's tooltip and in **About** in the tray menu. About also copies the details to the clipboard, ready to paste into an email or chat.
 
+## 1.12.0
+- **Copy last dictation** near the top of the right-click menu, plus **Recent dictations**: your last 20 dictations, newest first, with the time. Click one to copy it, then paste anywhere with Ctrl+V.
+  - Each dictation is saved to the list *before* it's typed, so it's never lost even if an app doesn't accept the typed keys.
+- New **History** tab in Options showing the full text. You can copy the selected dictation (including any edits made in the box), copy the last one, or clear the list.
+- The list is kept while the app runs and cleared when it closes.
+
 ## 1.11.1
 - New `custom_words_prompt.txt` in the app folder: a ready-made prompt for Gemini, ChatGPT or any AI chat. Paste it in with a word (e.g. DCS[N]) and it answers with lines in the exact `custom_words.txt` format, ready to copy across. It's included in the release ZIP and the portable bundle.
 

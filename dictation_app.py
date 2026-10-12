@@ -101,6 +101,7 @@ _bootstrap()
 # =============================================================================
 # 1. IMPORTS & CONFIGURATION
 # =============================================================================
+import collections
 import ctypes
 import io
 import json
@@ -116,7 +117,7 @@ import wave
 from pathlib import Path
 
 APP_NAME = "Dictation & Read-Aloud Helper"
-APP_VERSION = "1.11.1"  # bump on every release; see CHANGELOG.md
+APP_VERSION = "1.12.0"  # bump on every release; see CHANGELOG.md
 APP_DIR = Path(__file__).resolve().parent
 CACHE_DIR = APP_DIR / ".cache"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -246,6 +247,7 @@ VOICES = {
 DEFAULT_VOICE = "af_heart"
 SPEEDS = [0.8, 0.9, 1.0, 1.1, 1.25, 1.5]
 MAX_READ_CHARS = 20000
+HISTORY_SIZE = 20                      # recent dictations kept for "Copy last dictation"
 FIRST_CHUNK_CHARS = 90                 # short first sentence -> speech starts within ~1 s
 READ_CLIPBOARD_IF_NO_SELECTION = True  # F10 with nothing highlighted reads the clipboard
 
@@ -1625,6 +1627,7 @@ class OptionsWindow:
         tabs.pack(fill="both", expand=True, padx=10, pady=(10, 0))
         self._general_tab(tabs)
         self._keys_tab(tabs)
+        self._history_tab(tabs)
         self._recordings_tab(tabs)
         self._tools_tab(tabs)
         self._about_tab(tabs)
@@ -1707,6 +1710,69 @@ class OptionsWindow:
             "Esc can only be the stop key. Picking a key that's already used swaps the two. "
             "On laptops where F keys change brightness/volume, Right Ctrl or Pause can be easier."
         )).grid(row=4, column=0, columnspan=3, sticky="w")
+
+    def _history_tab(self, tabs):
+        tk, ttk, app = self.tk, self.ttk, self.app
+        f = ttk.Frame(tabs, padding=14)
+        tabs.add(f, text="History")
+        ttk.Label(f, wraplength=440, justify="left", text=(
+            f"Your last {HISTORY_SIZE} dictations (newest first). Pick one and copy it, then paste "
+            "it anywhere with Ctrl+V. This list is cleared when the app closes (the log file "
+            "dictation_app.log also notes what was heard, for troubleshooting)."
+        )).pack(anchor="w")
+        self.hist_list = tk.Listbox(f, height=7, width=60, font=self.FONT, activestyle="none",
+                                    exportselection=False)
+        self.hist_list.pack(fill="x", pady=(8, 4))
+        self.hist_list.bind("<<ListboxSelect>>", lambda e: self._show_selected())
+        self.hist_list.bind("<Double-Button-1>", lambda e: self._copy_selected())
+        self.hist_text = tk.Text(f, height=5, width=60, wrap="word", font=self.FONT)
+        self.hist_text.pack(fill="x")
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(8, 0))
+        ttk.Button(row, text="Copy selected", command=self._copy_selected).pack(side="left")
+        ttk.Button(row, text="Copy last", command=lambda: app.copy_dictation(0)
+                   ).pack(side="left", padx=8)
+        ttk.Button(row, text="Clear history", command=self._clear_history).pack(side="left")
+        self._hist_seen = -1
+
+    def _selected_index(self):
+        sel = self.hist_list.curselection()
+        return sel[0] if sel else 0
+
+    def _show_selected(self):
+        try:
+            _, text = list(self.app.history)[self._selected_index()]
+        except IndexError:
+            text = ""
+        self.hist_text.delete("1.0", "end")
+        self.hist_text.insert("1.0", text)
+
+    def _copy_selected(self):
+        # copy what's in the box, so small edits made there are included
+        text = self.hist_text.get("1.0", "end-1c").strip()
+        if not text:
+            self.app.copy_dictation(self._selected_index())
+        elif clip_set(text):
+            self.app.flash("Copied - paste it with Ctrl+V")
+
+    def _clear_history(self):
+        self.app.history.clear()
+        self.app.history_version += 1
+        try:
+            self.app.icon.update_menu()
+        except Exception:
+            pass
+
+    def _refresh_history(self):
+        if self._hist_seen == self.app.history_version:
+            return  # unchanged - don't disturb the user's selection
+        self._hist_seen = self.app.history_version
+        self.hist_list.delete(0, "end")
+        for stamp, text in self.app.history:
+            self.hist_list.insert("end", f"{stamp}   {text}")
+        if self.app.history:
+            self.hist_list.selection_set(0)
+        self._show_selected()
 
     def _recordings_tab(self, tabs):
         tk, ttk, app = self.tk, self.ttk, self.app
@@ -1819,6 +1885,7 @@ class OptionsWindow:
         self.v_stamps.set(bool(st.file_timestamps))
         self.v_open.set(bool(st.file_open_when_done))
         self.v_file_status.set(self.app.files.status)
+        self._refresh_history()
         self.cancel_btn.configure(state="normal" if self.app.files.busy else "disabled")
         for role, box in self.key_boxes.items():
             box.set(HOTKEY_CHOICES[KEYS[role]][1])
@@ -2005,6 +2072,11 @@ class App:
         self.speaker = Speaker(self)
         self.vocab = Vocabulary(VOCAB_FILE)
         self.stats = Stats()
+        # Recent dictations, newest first: (time "14:32", text). Kept in memory for
+        # this session, and recorded BEFORE typing, so the text is always
+        # recoverable even if an app swallows the typed keys.
+        self.history = collections.deque(maxlen=HISTORY_SIZE)
+        self.history_version = 0
         self.bubble = StatusBubble()
         self.bubble.enabled = bool(self.settings.show_bubble)
         self._options = None  # the Options window, while open
@@ -2101,6 +2173,11 @@ class App:
                  lambda icon, item: self.toggle_pause(), default=True),
             Item(lambda item: with_keys(STATE_LABELS.get(self.state, self.state)), None, enabled=False),
             Menu.SEPARATOR,
+            Item("Copy last dictation", lambda icon, item: self.copy_dictation(0),
+                 enabled=lambda item: bool(self.history)),
+            Item("Recent dictations", Menu(lambda: self._history_items()),
+                 enabled=lambda item: bool(self.history)),
+            Menu.SEPARATOR,
             Item("Microphone", Menu(mic_items)),
             Item("Reading voice", Menu(lambda: choice_items("voice", VOICES.items()))),
             Item("Reading speed", Menu(lambda: choice_items(
@@ -2117,6 +2194,41 @@ class App:
             Menu.SEPARATOR,
             Item("Quit", lambda icon, item: self.quit()),
         )
+
+    # ---- dictation history ---------------------------------------------------------
+    def _remember(self, text: str):
+        self.history.appendleft((time.strftime("%H:%M"), text))
+        self.history_version += 1
+        try:
+            self.icon.update_menu()  # the Windows tray menu is rebuilt only on request
+        except Exception:
+            pass
+
+    def copy_dictation(self, index: int = 0):
+        """Put a recent dictation on the clipboard (0 = the newest)."""
+        try:
+            _, text = list(self.history)[index]
+        except IndexError:
+            self.flash("Nothing dictated yet", "warn")
+            return
+        if clip_set(text):
+            log.info("Copied dictation #%d (%d chars) to the clipboard", index + 1, len(text))
+            self.flash("Copied - paste it with Ctrl+V")
+        else:
+            self.flash("Clipboard busy - try again", "warn")
+
+    def _history_items(self):
+        Item = pystray.MenuItem
+
+        def copy(i):
+            return lambda icon, item: self.copy_dictation(i)
+
+        items = []
+        for i, (stamp, text) in enumerate(self.history):
+            preview = text if len(text) <= 48 else text[:45].rstrip() + "..."
+            # "&" marks a keyboard shortcut in Windows menus, so double it to show it
+            items.append(Item(f"{stamp}   {preview}".replace("&", "&&"), copy(i)))
+        return items
 
     def _fallback_items(self, choice_items):
         Item, Menu = pystray.MenuItem, pystray.Menu
@@ -2683,6 +2795,7 @@ class App:
                 text = self._transcribe(audio)
                 transcribed = time.perf_counter()
                 if text:
+                    self._remember(text)
                     output_text(text + " ", self.settings.output_mode)
                     chime("success")
                     self.flash("Done")
