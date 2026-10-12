@@ -36,6 +36,7 @@ An offline dictation (speech-to-text) and read-aloud (text-to-speech) tool for W
 | **General** | Show the status bubble · insert dictated text by Typing or Pasting · **CPU usage** (Full speed / Balanced / Gentle) · dictation model (Fast `base.en` / Accurate `small.en`) |
 | **Recordings** | Transcribe audio files (WAV, M4A, MP3, MP4...) to `.txt` · model for recordings · timestamps · progress and Stop |
 | **History** | Your last 20 dictations with their full text · copy selected (including any edits made in the box) · copy last · clear |
+| **Microphone** | Choose the mic, with a **live sound wave** and a plain verdict ("Hearing you", "Very quiet", "Silent – muted?", "Too loud") so you can check it's the right one · Refresh after plugging in a mic |
 | **Keys** | Change the dictation, read-aloud and stop keys (list, or "Press a key...") · reset to F9 / F10 / Esc |
 | **Tools** | Live session statistics · check for model updates now · check automatically at startup · open app folder · edit custom words · pin icon to taskbar |
 | **About** | Version, models and Python details, with a button to copy them for support |

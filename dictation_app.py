@@ -117,7 +117,7 @@ import wave
 from pathlib import Path
 
 APP_NAME = "Dictation & Read-Aloud Helper"
-APP_VERSION = "1.12.0"  # bump on every release; see CHANGELOG.md
+APP_VERSION = "1.13.0"  # bump on every release; see CHANGELOG.md
 APP_DIR = Path(__file__).resolve().parent
 CACHE_DIR = APP_DIR / ".cache"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -862,27 +862,93 @@ def message_box(text: str, yes_no: bool = False) -> bool:
 # =============================================================================
 # 6. MICROPHONE RECORDING
 # =============================================================================
-def list_input_devices():
-    """Return [(index, name)] for input devices on the default host API
-    (avoids the same mic appearing 3-4 times under MME/DirectSound/WASAPI)."""
+def _input_hostapi() -> int:
+    """Which Windows audio system to list microphones from. WASAPI is preferred:
+    it gives the real, full device names. (The older MME cuts names to 31
+    characters, so two similar mics could look identical and the wrong one be
+    picked - a bug in versions before 1.13.)"""
     try:
+        apis = sd.query_hostapis()
+        if IS_WINDOWS:
+            for i, api in enumerate(apis):
+                if "WASAPI" in api["name"]:
+                    return i
         default_in = sd.default.device[0]
-        host = sd.query_devices(default_in)["hostapi"] if default_in is not None and default_in >= 0 else 0
-        return [(i, d["name"]) for i, d in enumerate(sd.query_devices())
-                if d["max_input_channels"] > 0 and d["hostapi"] == host]
+        if default_in is not None and default_in >= 0:
+            return sd.query_devices(default_in)["hostapi"]
+    except Exception as exc:
+        log.warning("Could not query audio systems: %s", exc)
+    return 0
+
+
+def list_input_devices():
+    """[(index, unique display name)] of the microphones Windows offers.
+    Identical names get " (2)", " (3)" so every entry can be told apart."""
+    try:
+        host = _input_hostapi()
+        devices, seen = [], {}
+        for i, d in enumerate(sd.query_devices()):
+            if d["max_input_channels"] > 0 and d["hostapi"] == host:
+                name = d["name"].strip()
+                seen[name] = seen.get(name, 0) + 1
+                devices.append((i, name if seen[name] == 1 else f"{name} ({seen[name]})"))
+        return devices
     except Exception as exc:
         log.warning("Could not list microphones: %s", exc)
         return []
 
 
+def default_input_device():
+    """(index, name) of Windows' default microphone, on the same audio system."""
+    try:
+        idx = sd.query_hostapis(_input_hostapi())["default_input_device"]
+        if idx is not None and idx >= 0:
+            return idx, sd.query_devices(idx)["name"].strip()
+    except Exception:
+        pass
+    return None, "unknown"
+
+
 def resolve_input_device(name):
+    """-> (device index or None for the default, found?). `found` is False when
+    the chosen mic has disappeared (unplugged, renamed) and the default is used."""
     if not name:
-        return None
-    for idx, dev_name in list_input_devices():
+        return default_input_device()[0], True
+    devices = list_input_devices()
+    for idx, dev_name in devices:
         if dev_name == name:
-            return idx
-    log.warning("Microphone '%s' not found; using system default", name)
-    return None
+            return idx, True
+    # Versions before 1.13 saved the shortened MME name: accept it if it's the
+    # start of exactly one current name.
+    matches = [idx for idx, dev_name in devices if dev_name.startswith(name)]
+    if len(matches) == 1:
+        return matches[0], True
+    log.warning("Microphone '%s' not found; using the Windows default instead", name)
+    return default_input_device()[0], False
+
+
+def open_input_stream(device, callback):
+    """Open a mono float32 input stream on `device` (an index; None = default).
+    Tries 16 kHz first (Whisper's rate); WASAPI is asked to convert for us, and
+    if the device still refuses, it records at its own rate (resampled later)."""
+    extra = None
+    try:
+        info = sd.query_devices(device if device is not None else sd.default.device[0])
+        if "WASAPI" in sd.query_hostapis(info["hostapi"])["name"]:
+            extra = sd.WasapiSettings(auto_convert=True)
+    except Exception:
+        extra = None
+    attempts = [dict(samplerate=SAMPLE_RATE, extra_settings=extra), dict(extra_settings=extra)]
+    if extra is not None:
+        attempts.append({})  # older sounddevice without auto_convert support
+    last_exc = None
+    for kwargs in attempts:
+        try:
+            return sd.InputStream(device=device, channels=1, dtype="float32",
+                                  callback=callback, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+    raise last_exc
 
 
 def resample(audio: np.ndarray, src_rate: float, dst_rate: float) -> np.ndarray:
@@ -894,6 +960,84 @@ def resample(audio: np.ndarray, src_rate: float, dst_rate: float) -> np.ndarray:
     return np.interp(x_new, x_old, audio).astype(np.float32)
 
 
+class MicMonitor:
+    """Live level of a microphone for the Options window: keeps the loudness of
+    each 10 ms slice of the last few seconds. Separate from Recorder, so it can
+    run while you test a mic without recording anything."""
+
+    SLICE = SAMPLE_RATE // 100   # 10 ms
+    KEEP = 300                   # 3 seconds of slices
+
+    def __init__(self):
+        self._stream = None
+        self.levels = collections.deque([0.0] * self.KEEP, maxlen=self.KEEP)
+        self.device_name = ""
+        self.error = ""
+        self._lock = threading.Lock()
+
+    @property
+    def running(self) -> bool:
+        return self._stream is not None
+
+    def _callback(self, indata, frames, time_info, status):
+        data = np.abs(indata[:, 0])
+        rate = self._stream.samplerate if self._stream is not None else SAMPLE_RATE
+        step = max(1, int(rate // 100))
+        for i in range(0, data.size, step):
+            self.levels.append(float(data[i:i + step].max()))
+
+    def start(self, device):
+        self.stop()
+        with self._lock:
+            self.error = ""
+            try:
+                stream = open_input_stream(device, self._callback)
+                self._stream = stream
+                stream.start()
+                self.device_name = sd.query_devices(stream.device)["name"].strip()
+            except Exception as exc:
+                self._stream = None
+                self.device_name = ""
+                self.error = str(exc) or type(exc).__name__
+                log.warning("Mic test could not open the microphone: %s", exc)
+
+    def stop(self):
+        with self._lock:
+            stream, self._stream = self._stream, None
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+        self.levels.extend([0.0] * self.KEEP)
+
+    def snapshot(self):
+        """A copy of the levels that's safe while the audio thread is adding to them."""
+        for _ in range(5):
+            try:
+                return list(self.levels)
+            except RuntimeError:  # changed while copying - try again
+                continue
+        return [0.0] * self.KEEP
+
+    def verdict(self):
+        """(text, colour) describing the last half second."""
+        if self.error:
+            return "Can't open this microphone - it may be in use or unplugged", "#c62828"
+        if not self.running:
+            return "Not listening", "#777777"
+        recent = self.snapshot()[-50:]
+        peak = max(recent) if recent else 0.0
+        if peak >= 0.98:
+            return "Too loud - it may distort; lower the input volume", "#c62828"
+        if peak < 0.002:
+            return "Silent - this mic is muted, switched off or not connected", "#c62828"
+        if peak < 0.03:
+            return "Very quiet - speak up, move closer or raise the input volume", "#e08a00"
+        return "Hearing you - this mic is working", "#2e7d32"
+
+
 class Recorder:
     """Collects microphone audio between start() and stop()."""
 
@@ -902,6 +1046,7 @@ class Recorder:
         self._frames = []
         self._rate = SAMPLE_RATE
         self._lock = threading.Lock()
+        self.device_name = ""
 
     @property
     def active(self) -> bool:
@@ -915,13 +1060,7 @@ class Recorder:
     def start(self, device) -> None:
         with self._lock:
             self._frames = []
-            try:
-                stream = sd.InputStream(device=device, channels=1, samplerate=SAMPLE_RATE,
-                                        dtype="float32", callback=self._callback)
-            except Exception:
-                # Some devices refuse 16 kHz; record natively and resample later.
-                stream = sd.InputStream(device=device, channels=1, dtype="float32",
-                                        callback=self._callback)
+            stream = open_input_stream(device, self._callback)
             self._rate = stream.samplerate
             try:
                 stream.start()
@@ -929,6 +1068,11 @@ class Recorder:
                 stream.close()
                 raise
             self._stream = stream
+            try:
+                self.device_name = sd.query_devices(stream.device)["name"].strip()
+            except Exception:
+                self.device_name = "unknown"
+            log.info("Recording from: %s (%d Hz)", self.device_name, int(self._rate))
 
     def stop(self) -> np.ndarray:
         with self._lock:
@@ -1626,6 +1770,7 @@ class OptionsWindow:
         tabs = ttk.Notebook(win)
         tabs.pack(fill="both", expand=True, padx=10, pady=(10, 0))
         self._general_tab(tabs)
+        self._mic_tab(tabs)
         self._keys_tab(tabs)
         self._history_tab(tabs)
         self._recordings_tab(tabs)
@@ -1685,6 +1830,96 @@ class OptionsWindow:
             ttk.Radiobutton(box, text=label + hint, value=value, variable=self.v_model,
                             command=lambda: app._set_setting("whisper_model", self.v_model.get())
                             ).pack(anchor="w")
+
+    def _mic_tab(self, tabs):
+        tk, ttk = self.tk, self.ttk
+        f = ttk.Frame(tabs, padding=14)
+        tabs.add(f, text="Microphone")
+        self.mic_tab = f
+        ttk.Label(f, wraplength=440, justify="left", text=(
+            "Choose the microphone for dictation. While this tab is open it listens to the "
+            "chosen mic and draws the sound below, so you can check it's the right one - "
+            "try speaking, then muting it."
+        )).pack(anchor="w")
+        row = ttk.Frame(f)
+        row.pack(fill="x", pady=8)
+        self.mic_box = ttk.Combobox(row, state="readonly", width=44, font=self.FONT)
+        self.mic_box.pack(side="left")
+        self.mic_box.bind("<<ComboboxSelected>>", lambda e: self._mic_chosen())
+        ttk.Button(row, text="Refresh", command=self._mic_refresh).pack(side="left", padx=8)
+        self.v_mic_using = tk.StringVar()
+        ttk.Label(f, textvariable=self.v_mic_using, foreground="#555555").pack(anchor="w")
+        self.wave = tk.Canvas(f, width=440, height=110, background="#111418", highlightthickness=0)
+        self.wave.pack(fill="x", pady=8)
+        self.v_mic_verdict = tk.StringVar()
+        self.mic_verdict = ttk.Label(f, textvariable=self.v_mic_verdict, font=(self.FONT[0], 12, "bold"))
+        self.mic_verdict.pack(anchor="w")
+        self.monitor = MicMonitor()
+        self._mic_choices = []
+        self._mic_fill()
+        tabs.bind("<<NotebookTabChanged>>", lambda e: self._mic_tab_visibility())
+        self._draw_wave()
+
+    def _mic_fill(self):
+        devices = list_input_devices()
+        self._mic_choices = [None] + [name for _, name in devices]
+        labels = [f"System default ({default_input_device()[1]})"] + [n for _, n in devices]
+        self.mic_box.configure(values=labels)
+        current = self.app.settings.mic
+        if current in self._mic_choices:
+            self.mic_box.current(self._mic_choices.index(current))
+        else:  # an older saved name or a missing mic: show what will really be used
+            device, found = resolve_input_device(current)
+            names = dict(devices)
+            if found and device in names:
+                self.mic_box.current(self._mic_choices.index(names[device]))
+            else:
+                self.mic_box.current(0)
+
+    def _mic_chosen(self):
+        name = self._mic_choices[self.mic_box.current()]
+        self.app._set_setting("mic", name)
+        self._mic_tab_visibility(restart=True)
+
+    def _mic_refresh(self):
+        self.monitor.stop()
+        self.app._refresh_devices()
+        self._mic_fill()
+        self._mic_tab_visibility(restart=True)
+
+    def _mic_tab_visibility(self, restart=False):
+        """Listen only while the Microphone tab is showing."""
+        try:
+            showing = self.win.winfo_exists() and self.tabs.select() == str(self.mic_tab)
+        except Exception:
+            showing = False
+        if showing and (restart or not self.monitor.running):
+            device, found = resolve_input_device(self.app.settings.mic)
+            self.monitor.start(device)
+        elif not showing:
+            self.monitor.stop()
+
+    def _draw_wave(self):
+        if not self.win.winfo_exists():
+            return
+        c = self.wave
+        c.delete("all")
+        w = max(int(c.winfo_width()), 440)
+        h = int(c["height"])
+        mid = h / 2
+        text, colour = self.monitor.verdict()
+        levels = self.monitor.snapshot()
+        n = len(levels)
+        c.create_line(0, mid, w, mid, fill="#2a2f36")
+        for x in range(0, w, 2):  # one 2-px bar per slice of the last 3 seconds
+            v = min(1.0, levels[int(x * n / w)] * 1.6)   # a little gain so speech fills the box
+            if v > 0.003:
+                c.create_line(x, mid - v * (mid - 4), x, mid + v * (mid - 4), fill=colour, width=2)
+        self.v_mic_verdict.set(text)
+        self.mic_verdict.configure(foreground=colour)
+        self.v_mic_using.set(f"Listening to: {self.monitor.device_name}" if self.monitor.running
+                             else "")
+        self.win.after(60, self._draw_wave)
 
     def _keys_tab(self, tabs):
         tk, ttk, app = self.tk, self.ttk, self.app
@@ -1907,6 +2142,10 @@ class OptionsWindow:
         self.win.focus_force()
 
     def close(self):
+        try:
+            self.monitor.stop()
+        except Exception:
+            pass
         self.app._options = None
         self.win.destroy()
 
@@ -2150,11 +2389,14 @@ class App:
             def is_on(name):
                 return lambda item: self.settings.mic == name
 
-            items = [Item("System default", pick(None), checked=is_on(None), radio=True)]
+            default_name = default_input_device()[1]
+            items = [Item(f"System default ({default_name})".replace("&", "&&"), pick(None),
+                          checked=is_on(None), radio=True)]
             for _, name in list_input_devices():
-                items.append(Item(name, pick(name), checked=is_on(name), radio=True))
+                items.append(Item(name.replace("&", "&&"), pick(name), checked=is_on(name), radio=True))
             items.append(Menu.SEPARATOR)
             items.append(Item("Refresh list", lambda icon, item: self._refresh_devices()))
+            items.append(Item("Test microphone...", lambda icon, item: self._open_options("mic")))
             return items
 
         def choice_items(key, options):
@@ -2251,7 +2493,7 @@ class App:
                 target=self._show_about, name="about", daemon=True).start()),
         ]
 
-    def _open_options(self):
+    def _open_options(self, tab=None):
         if not self.bubble.ok:
             self.notify("The Options window needs tkinter (included with the python.org "
                         "installer). Use the 'More' menu instead.")
@@ -2262,6 +2504,8 @@ class App:
                 self._options.show()  # already open: bring it to the front
             else:
                 self._options = OptionsWindow(root, self)
+            if tab == "mic":
+                self._options.tabs.select(self._options.mic_tab)
         self.bubble.call(open_on_tk_thread)
 
     def _set_setting(self, key, value):
@@ -2527,6 +2771,11 @@ class App:
             self.notify(f"Could not open {VOCAB_FILE.name}: {exc}")
 
     def _refresh_devices(self):
+        if self._options is not None:
+            try:
+                self._options.monitor.stop()
+            except Exception:
+                pass
         if self.recorder.active or self.speaker.busy:
             self.notify("Finish dictating/reading before refreshing devices.")
             return
@@ -2694,7 +2943,8 @@ class App:
             return
         self.speaker.stop()  # don't record our own voice
         try:
-            self.recorder.start(resolve_input_device(self.settings.mic))
+            device, found = resolve_input_device(self.settings.mic)
+            self.recorder.start(device)
         except Exception as exc:
             log.exception("Could not open microphone")
             chime("error")
@@ -2703,7 +2953,12 @@ class App:
             return
         chime("start")
         self._record_started = time.time()
-        self.set_state("recording")
+        # say so in the bubble if the chosen mic is missing and the default is used
+        self.set_state("recording", None if found else "default mic used")
+        if not found:
+            self.notify(f"Your chosen microphone ({self.settings.mic}) wasn't found, so the "
+                        f"Windows default ({self.recorder.device_name}) was used. Pick a mic "
+                        "again in Options > Microphone.")
         self._watchdog = threading.Timer(MAX_RECORD_SECONDS, self.events.put, ("dictate_timeout",))
         self._watchdog.daemon = True
         self._watchdog.start()

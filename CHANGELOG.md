@@ -2,6 +2,16 @@
 
 The version number is shown in the tray icon's tooltip and in **About** in the tray menu. About also copies the details to the clipboard, ready to paste into an email or chat.
 
+## 1.13.0
+- **Fixed: the chosen microphone could be ignored.**
+  - Microphones are now listed through Windows' modern audio system (WASAPI), with full names. Before, names were cut to 31 characters, so two similar mics could look identical and the wrong one be used.
+  - Identically named mics are numbered "(2)", "(3)".
+  - Mic choices saved by older versions are still recognised.
+- If your chosen mic can't be found (e.g. unplugged), the bubble says **"default mic used"** and a notification explains it. Before, it switched to the default mic silently.
+- Every recording logs exactly which mic it came from (`Recording from: ...`).
+- New **Options → Microphone** tab: choose the mic and see a **live sound wave** with a plain verdict ("Hearing you", "Very quiet", "Silent – muted?", "Too loud"). It only listens while the tab is open.
+- **Microphone → Test microphone...** in the tray menu opens that tab. **System default** now shows which mic it actually is.
+
 ## 1.12.0
 - **Copy last dictation** near the top of the right-click menu, plus **Recent dictations**: your last 20 dictations, newest first, with the time. Click one to copy it, then paste anywhere with Ctrl+V.
   - Each dictation is saved to the list *before* it's typed, so it's never lost even if an app doesn't accept the typed keys.
