@@ -73,7 +73,9 @@ def _bootstrap() -> None:
     # Normal install works for venvs and per-user/portable Pythons; if the
     # interpreter folder is read-only we fall back to the user site-packages.
     attempts = [base_cmd + missing]
-    if sys.prefix == sys.base_prefix:  # not inside a venv -> --user is legal
+    # Not inside a venv -> --user is a legal fallback. Never for a portable Python
+    # (started with -s): its packages must stay inside its own folder.
+    if sys.prefix == sys.base_prefix and not sys.flags.no_user_site:
         attempts.append(base_cmd + ["--user"] + missing)
 
     for cmd in attempts:
@@ -90,7 +92,8 @@ def _bootstrap() -> None:
     # Restart in a fresh interpreter so newly installed packages (and any new
     # user site-packages folder) are importable.
     print("\nPackages installed. Restarting the app...\n")
-    sys.exit(subprocess.call([sys.executable] + sys.argv))
+    flags = ["-s"] if sys.flags.no_user_site else []  # keep a portable Python portable
+    sys.exit(subprocess.call([sys.executable] + flags + sys.argv))
 
 
 _bootstrap()
@@ -113,7 +116,7 @@ import wave
 from pathlib import Path
 
 APP_NAME = "Dictation & Read-Aloud Helper"
-APP_VERSION = "1.10.0"  # bump on every release; see CHANGELOG.md
+APP_VERSION = "1.11.0"  # bump on every release; see CHANGELOG.md
 APP_DIR = Path(__file__).resolve().parent
 CACHE_DIR = APP_DIR / ".cache"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -279,10 +282,19 @@ except Exception:
 
 import numpy as np
 import pyperclip
-import sounddevice as sd
 from PIL import Image, ImageDraw
-from pynput import keyboard
-import pystray
+
+# --download-models (used to build a portable bundle) needs no sound, keyboard or
+# tray, so it must work even on a PC/server where those can't start.
+HEADLESS = "--download-models" in sys.argv
+try:
+    import sounddevice as sd
+    from pynput import keyboard
+    import pystray
+except Exception:
+    if not HEADLESS:
+        raise
+    sd = keyboard = pystray = None
 
 if IS_WINDOWS:
     import winsound
@@ -394,7 +406,7 @@ def chime(name: str) -> None:
 # =============================================================================
 # 4. CLIPBOARD & KEYBOARD SIMULATION
 # =============================================================================
-_kb = keyboard.Controller()
+_kb = keyboard.Controller() if keyboard else None
 _clipboard_lock = threading.Lock()  # dictation paste and read-aloud copy never overlap
 
 
@@ -1983,7 +1995,8 @@ class App:
         self.settings = Settings()
         self.settings.apply_keys()
         self.settings.validate()
-        self._capture_role = None  # set while "Press a key to choose" is waiting        self.stt = None
+        self._capture_role = None  # set while "Press a key to choose" is waiting
+        self.stt = None
         self.tts = None
         self.state = "loading"
         self.events = queue.Queue()
@@ -2727,7 +2740,26 @@ def _single_instance() -> bool:
     return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
 
 
+def download_models_only() -> int:
+    """`python dictation_app.py --download-models [--whisper=small.en]`: fetch the
+    speech models into .cache and exit (used by make_portable_bundle.bat)."""
+    names = [a.split("=", 1)[1] for a in sys.argv if a.startswith("--whisper=")]
+    try:
+        for name in dict.fromkeys([DEFAULT_WHISPER_MODEL] + names):
+            log.info("Preparing dictation model %s ...", name)
+            load_whisper(name)
+        log.info("Preparing read-aloud voice ...")
+        load_kokoro()
+    except Exception:
+        log.exception("Model download failed")
+        return 1
+    log.info("All models are in %s", CACHE_DIR)
+    return 0
+
+
 def main():
+    if "--download-models" in sys.argv:
+        sys.exit(download_models_only())
     if IS_WINDOWS:
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(1)

@@ -49,17 +49,27 @@ echo [3/5] Removing the start-at-login shortcut...
 powershell -NoProfile -Command "$sh = New-Object -ComObject WScript.Shell; Get-ChildItem ([Environment]::GetFolderPath('Startup')) -Filter *.lnk | Where-Object { ([string]$sh.CreateShortcut($_.FullName).TargetPath).StartsWith($env:APPDIR + '\', 'OrdinalIgnoreCase') } | Remove-Item -Force"
 
 echo [4/5] Python packages
+if exist "%APPDIR%\python\python.exe" goto :portable_python
 echo       The helper installed about 600 MB of Python packages - faster-whisper, kokoro-onnx, etc.
 echo       Keep them if you will reinstall soon: the next first run is then much quicker.
 echo       Common packages that other programs may use - numpy, pillow - are always kept.
 choice /c YN /m "      Remove the helper's Python packages too"
 if errorlevel 2 goto :skip_packages
-python -m pip uninstall -y faster-whisper ctranslate2 av tokenizers onnxruntime kokoro-onnx espeakng-loader phonemizer phonemizer-fork sounddevice pynput pyperclip pystray truststore
-python -m pip cache purge
+call "%APPDIR%\find_python.bat" 2>nul
+if not defined PY set "PY=python"
+"%PY%" -m pip uninstall -y faster-whisper ctranslate2 av tokenizers onnxruntime kokoro-onnx espeakng-loader phonemizer phonemizer-fork sounddevice pynput pyperclip pystray truststore
+"%PY%" -m pip cache purge
+goto :skip_packages
+
+:portable_python
+echo       This is a portable bundle: its Python and packages are in the "python" folder.
+choice /c YN /m "      Delete the bundled portable Python too"
+if errorlevel 2 goto :skip_packages
+rd /s /q "%APPDIR%\python"
 :skip_packages
 
 echo [5/5] Deleting the app files...
-del /q "dictation_app.py" "README.md" "requirements.txt" ".gitignore" "run_first_time.bat" "run_silent.bat" 2>nul
+del /q "dictation_app.py" "README.md" "CHANGELOG.md" "requirements.txt" ".gitignore" "run_first_time.bat" "run_silent.bat" "find_python.bat" "make_portable_bundle.bat" 2>nul
 
 echo.
 echo Uninstall complete. If a helper icon is still in the system tray,

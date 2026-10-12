@@ -53,7 +53,8 @@ jobs:
           mkdir -p dist
           zip -j "dist/DictationHelper-$TAG.zip" \
             dictation_app.py README.md CHANGELOG.md requirements.txt \
-            run_first_time.bat run_silent.bat uninstall.bat
+            find_python.bat run_first_time.bat run_silent.bat uninstall.bat \
+            make_portable_bundle.bat
 
       - name: Release notes from CHANGELOG.md
         if: steps.version.outputs.exists == 'false'

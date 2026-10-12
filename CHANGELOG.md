@@ -2,6 +2,13 @@
 
 The version number is shown in the tray icon's tooltip and in **About** in the tray menu. About also copies the details to the clipboard, ready to paste into an email or chat.
 
+## 1.11.0
+- **Portable bundle:** `make_portable_bundle.bat` builds a self-contained folder and ZIP on a PC with internet: a portable Python, all the packages and the speech models. Copy it to a work PC and run it, with no Python install, no admin rights and no internet needed.
+- The `.bat` launchers find a portable Python automatically: a bundled `python\` folder, then WinPython next to the app, then the installed Python. `run_first_time.bat` shows which one is used.
+- A portable Python keeps its packages inside its own folder and ignores the user's personal packages.
+- `uninstall.bat` offers to delete a bundled Python and removes the new files.
+- Fixed: pressing the dictation key, or changing CPU usage, while the models were still loading logged an error instead of saying "still loading" (bug since 1.7.0).
+
 ## 1.10.0
 - **Transcribe recordings:** use **Options → Recordings → Choose audio files to transcribe...**
   - Works with WAV, M4A (iPhone voice memos), MP3, OGG, FLAC, AAC and video files such as MP4.

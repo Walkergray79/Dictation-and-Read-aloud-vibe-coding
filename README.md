@@ -124,8 +124,11 @@ Choose **one** option. Use **Python 3.12** (kokoro-onnx supports 3.10–3.13).
 
 ### Option B: WinPython (fully portable, nothing "installed")
 1. Download a WinPython 3.12 "dot" release (the small one).
-2. Extract it to any folder you can write to, such as `C:\Users\<you>\Tools\WinPython` or a USB stick.
-3. Open *WinPython Command Prompt.exe* in that folder and run the commands below from it.
+2. Extract it **into the app folder**, so you have e.g. `C:\Users\<you>\DictationHelper\WPy64-31230\`.
+3. Run `run_first_time.bat` as usual. The `.bat` files find WinPython next to them automatically.
+
+### Option D: the portable bundle (best for a locked-down or offline work PC)
+See **Portable bundle** below. You build everything once on a home PC, then copy one folder.
 
 ### Option C: `uv` (one small exe)
 ```bat
@@ -135,6 +138,23 @@ uv venv --python 3.12 .venv
 ```
 
 > The python.org *embeddable* zip also works, but it needs extra setup. Uncomment `import site` in `python312._pth`, then run `get-pip.py`. Options A and B are easier.
+
+## Portable bundle (no install, no admin, no internet on the work PC)
+
+On a PC **with** internet (e.g. at home), run **`make_portable_bundle.bat`** from the app folder. It:
+1. downloads a portable Python 3.12 (via [uv](https://github.com/astral-sh/uv)), which is not installed or registered in Windows;
+2. installs all the packages *inside* that Python;
+3. downloads the speech models, re-using any you already have. It can also include the Accurate model and your custom words.
+4. produces `DictationHelper-portable\` and `DictationHelper-portable.zip`, about 1–1.5 GB.
+
+Copy the folder or ZIP to the work PC or a USB stick, put it somewhere short like `C:\Users\<you>\DictationHelper\`, and double-click `run_first_time.bat`, then use `run_silent.bat` from then on. The work PC needs **no Python, no admin rights and no internet**. Everything, including Python itself, lives in that one folder. To remove it, run `uninstall.bat` (it offers to delete the bundled Python too), or just delete the folder.
+
+**Which Python do the `.bat` files use?** They look, in order, for:
+1. a `python\` folder next to them (the portable bundle);
+2. a WinPython `WPy64-...` folder next to them;
+3. the Python installed on the PC.
+
+`run_first_time.bat` prints which one it's using.
 
 ## Where to put the files
 
