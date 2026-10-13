@@ -2,6 +2,16 @@
 
 The version number is shown in the tray icon's tooltip and in **About** in the tray menu. About also copies the details to the clipboard, ready to paste into an email or chat.
 
+## 1.13.1
+- **Key tester** in **Options → Keys**: press your dictation key and it shows what Windows actually reported.
+  - "F9 received – it IS reaching the app";
+  - "Windows reported Volume Down – hold Fn";
+  - "nothing yet – remote desktop / Citrix?";
+  - "the app is PAUSED".
+- **Restart keyboard listener** button in the same place.
+- The keyboard listener is now re-armed every 5 minutes while idle. Windows can silently drop it when the PC is busy (e.g. at login), which left F9/F10 dead until a restart.
+- The log notes each "Dictation key pressed", to tell key problems from mic problems.
+
 ## 1.13.0
 - **Fixed: the chosen microphone could be ignored.**
   - Microphones are now listed through Windows' modern audio system (WASAPI), with full names. Before, names were cut to 31 characters, so two similar mics could look identical and the wrong one be used.

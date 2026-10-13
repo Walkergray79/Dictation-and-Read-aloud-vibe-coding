@@ -117,7 +117,7 @@ import wave
 from pathlib import Path
 
 APP_NAME = "Dictation & Read-Aloud Helper"
-APP_VERSION = "1.13.0"  # bump on every release; see CHANGELOG.md
+APP_VERSION = "1.13.1"  # bump on every release; see CHANGELOG.md
 APP_DIR = Path(__file__).resolve().parent
 CACHE_DIR = APP_DIR / ".cache"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -247,6 +247,7 @@ VOICES = {
 DEFAULT_VOICE = "af_heart"
 SPEEDS = [0.8, 0.9, 1.0, 1.1, 1.25, 1.5]
 MAX_READ_CHARS = 20000
+HOOK_REARM_SECONDS = 300               # re-install the keyboard hook every 5 minutes when idle
 HISTORY_SIZE = 20                      # recent dictations kept for "Copy last dictation"
 FIRST_CHUNK_CHARS = 90                 # short first sentence -> speech starts within ~1 s
 READ_CLIPBOARD_IF_NO_SELECTION = True  # F10 with nothing highlighted reads the clipboard
@@ -1294,6 +1295,7 @@ class HotkeyListener:
         self.is_capturing = is_capturing  # callable -> True while choosing a new key
         self._down = set()                # hotkeys whose key-down we took (and swallowed)
         self._capture_down = set()        # keys pressed while choosing a new key
+        self.last_key = None              # (virtual-key code, time) of the last key seen
         self._listener = None
 
     def start(self):
@@ -1343,6 +1345,8 @@ class HotkeyListener:
             return True
         vk = data.vkCode
         is_down = msg in (WM_KEYDOWN, WM_SYSKEYDOWN)
+        if is_down:
+            self.last_key = (vk, time.time())  # shown by Options -> Keys -> key tester
         # "Press a key to choose": the next key press is captured, not acted on.
         if vk in self._capture_down and not is_down:
             self._capture_down.discard(vk)
@@ -1946,6 +1950,46 @@ class OptionsWindow:
             "On laptops where F keys change brightness/volume, Right Ctrl or Pause can be easier."
         )).grid(row=4, column=0, columnspan=3, sticky="w")
 
+        box = ttk.LabelFrame(f, text="Key tester - press your dictation key now", padding=8)
+        box.grid(row=5, column=0, columnspan=3, sticky="we", pady=(14, 0))
+        self.v_keytest = tk.StringVar()
+        self.keytest = ttk.Label(box, textvariable=self.v_keytest, wraplength=420, justify="left")
+        self.keytest.pack(anchor="w")
+        ttk.Button(box, text="Restart keyboard listener", command=lambda: (
+            app.restart_hotkeys("restarted from Options"), app.flash("Keyboard listener restarted"))
+                   ).pack(anchor="w", pady=(6, 0))
+        self._keytest_since = time.time()
+
+    def _keytest_text(self):
+        """What the keyboard listener last saw, in plain words."""
+        app = self.app
+        if app.paused:
+            return ("The app is PAUSED, so hotkeys are switched off. Left-click the tray icon "
+                    "(or use its menu) to turn it back on."), "#c62828"
+        last = app.hotkeys.last_key
+        if not last or last[1] < self._keytest_since:
+            return ("Waiting for a key... Press your dictation key. If nothing appears here, "
+                    "the key isn't reaching the app: try holding Fn with it, or check you're "
+                    "not in a remote desktop / Citrix window."), "#555555"
+        vk, when = last
+        names = {code: label for code, label in HOTKEY_CHOICES.values()}
+        names.update({0xAD: "Volume Mute", 0xAE: "Volume Down", 0xAF: "Volume Up",
+                      0xB0: "Next Track", 0xB1: "Previous Track", 0xB3: "Play/Pause",
+                      0xA2: "Left Ctrl", 0xA0: "Left Shift", 0xA1: "Right Shift",
+                      0xA4: "Left Alt", 0xA5: "Right Alt", 0x5B: "Windows key"})
+        name = names.get(vk) or (chr(vk) if 0x30 <= vk <= 0x5A else f"key code {vk:#04x}")
+        roles = {HOTKEY_CHOICES[KEYS[r]][0]: r for r in ("dictate", "read", "stop")}
+        ago = time.time() - when
+        if vk in roles:
+            return (f"{name} received {ago:.0f}s ago - that's your "
+                    f"{ROLE_NAMES[roles[vk]].lower()} key, so it IS reaching the app."), "#2e7d32"
+        if vk in (0xAD, 0xAE, 0xAF, 0xB0, 0xB1, 0xB3):
+            return (f"Windows reported {name}, not an F key - this keyboard sends a special "
+                    f"function. Hold Fn with the key (or turn on Fn Lock), or choose another "
+                    f"key above."), "#e08a00"
+        return (f"Last key received: {name} ({ago:.0f}s ago). That isn't one of your hotkeys "
+                f"(dictation is {key_label('dictate')})."), "#555555"
+
     def _history_tab(self, tabs):
         tk, ttk, app = self.tk, self.ttk, self.app
         f = ttk.Frame(tabs, padding=14)
@@ -2121,6 +2165,9 @@ class OptionsWindow:
         self.v_open.set(bool(st.file_open_when_done))
         self.v_file_status.set(self.app.files.status)
         self._refresh_history()
+        text, colour = self._keytest_text()
+        self.v_keytest.set(text)
+        self.keytest.configure(foreground=colour)
         self.cancel_btn.configure(state="normal" if self.app.files.busy else "disabled")
         for role, box in self.key_boxes.items():
             box.set(HOTKEY_CHOICES[KEYS[role]][1])
@@ -2894,16 +2941,39 @@ class App:
 
     # ---- background loops ---------------------------------------------------
     def _hook_health_loop(self):
-        """Restart the keyboard hook if its thread ever dies."""
+        """Keep the keyboard hook alive. Windows silently removes a low-level hook
+        if the PC is too busy for it to answer quickly (e.g. at login or under heavy
+        load) - the thread keeps running but no keys arrive, and nothing can detect
+        that. So besides restarting a dead thread, the hook is re-armed every few
+        minutes while the app is idle."""
+        last_rearm = time.time()
         while self._running:
             time.sleep(5)
-            if self._running and not self.hotkeys.alive():
-                log.warning("Hotkey listener stopped - restarting it")
-                try:
-                    self.hotkeys = self._new_hotkey_listener()
-                    self.hotkeys.start()
-                except Exception:
-                    log.exception("Could not restart hotkey listener")
+            if not self._running:
+                break
+            dead = not self.hotkeys.alive()
+            due = time.time() - last_rearm >= HOOK_REARM_SECONDS
+            idle = not (self.is_busy() or self._capture_role or self.hotkeys._down)
+            if dead or (due and idle):
+                self.restart_hotkeys("listener stopped" if dead else None)
+                last_rearm = time.time()
+
+    def restart_hotkeys(self, reason=None):
+        """Replace the keyboard listener with a fresh one (also Options -> Keys)."""
+        if reason:
+            log.warning("Hotkey listener %s - restarting it", reason)
+        old = self.hotkeys
+        try:
+            new = self._new_hotkey_listener()
+            new.start()
+            self.hotkeys = new
+        except Exception:
+            log.exception("Could not restart hotkey listener")
+            return
+        try:
+            old.stop()
+        except Exception:
+            pass
 
     def _controller_loop(self):
         """Single thread that owns recording state; events arrive from the hook."""
@@ -2935,11 +3005,14 @@ class App:
                 chime("error")
 
     def _on_dictate_down(self):
+        log.info("Dictation key pressed")
         if self.stt is None:
             chime("error")
             self.notify("Still loading speech models - please wait a moment.")
             return
         if self.recorder.active:
+            return
+        if self.paused:
             return
         self.speaker.stop()  # don't record our own voice
         try:
